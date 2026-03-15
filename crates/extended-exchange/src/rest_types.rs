@@ -3,18 +3,41 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+/// Universal REST API response wrapper: `{"status":"OK","data":...}`
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiResponse<T> {
+    pub status: Option<String>,
+    pub data: T,
+}
+
 /// Market info from GET /api/v1/info/markets.
+/// Actual response: `{"name":"BTC-USD","active":true,"tradingConfig":{...},"settlementConfig":{...},...}`
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketResponse {
-    pub market: String,
-    pub name: Option<String>,
-    pub active: bool,
+    /// Market name, e.g. "BTC-USD"
+    pub name: String,
+    pub active: Option<bool>,
     pub asset_precision: Option<u32>,
     pub collateral_asset_precision: Option<u32>,
-    pub min_trade_size: Option<Decimal>,
-    pub min_price_change: Option<Decimal>,
-    pub l2_config: Option<L2ConfigResponse>,
+    pub trading_config: Option<TradingConfigResponse>,
+    pub settlement_config: Option<L2ConfigResponse>,
+}
+
+impl MarketResponse {
+    /// Convenience: market name
+    pub fn market(&self) -> &str {
+        &self.name
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradingConfigResponse {
+    pub min_order_size: Option<String>,
+    pub min_order_size_change: Option<String>,
+    pub min_price_change: Option<String>,
+    pub max_leverage: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,13 +50,20 @@ pub struct L2ConfigResponse {
 }
 
 /// Balance from GET /api/v1/user/balance.
+/// Actual response: {"collateralName":"USD","balance":"1000","equity":"1000",
+///   "availableForTrade":"1000","unrealisedPnl":"0","initialMargin":"0",...}
+/// Note: data is a single object, not an array.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BalanceResponse {
     pub equity: Decimal,
+    #[serde(alias = "availableForTrade")]
     pub available_balance: Decimal,
     pub initial_margin: Option<Decimal>,
-    pub maintenance_margin: Option<Decimal>,
+    pub unrealised_pnl: Option<Decimal>,
+    pub margin_ratio: Option<String>,
+    pub exposure: Option<String>,
+    pub leverage: Option<String>,
 }
 
 /// Position from GET /api/v1/user/positions.
@@ -142,15 +172,22 @@ pub struct Settlement {
 }
 
 /// Account info from GET /api/v1/user/account/info.
+/// Actual response: {"accountId":15832,"l2Key":"0x...","l2Vault":"512833",...}
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountInfoResponse {
-    pub account_id: Option<String>,
-    pub stark_key: Option<String>,
-    pub vault_id: Option<u64>,
-    pub collateral_balance: Option<Decimal>,
-    pub margin_mode: Option<String>,
-    pub leverage: Option<u32>,
+    pub account_id: Option<u64>,
+    pub l2_key: Option<String>,
+    /// Vault ID as string — parse to u64 for signing
+    pub l2_vault: Option<String>,
+    pub status: Option<String>,
+    pub api_keys: Option<Vec<String>>,
+}
+
+impl AccountInfoResponse {
+    pub fn vault_id(&self) -> Option<u64> {
+        self.l2_vault.as_ref()?.parse().ok()
+    }
 }
 
 /// Order creation request body.

@@ -133,6 +133,17 @@ impl MarketBot {
                 external_id, exchange_id, price, qty, fee, is_maker, ..
             } => {
                 let resolved_ext_id = self.resolve_external_id(&external_id, &exchange_id);
+                // Record fill for markout evaluation — skip if side unknown
+                if let Some(mid) = self.state.orderbook.mid() {
+                    if let Some(order) = self.state.order_tracker.get_by_external_id(&resolved_ext_id) {
+                        let is_buy = order.side == extended_types::order::Side::Buy;
+                        self.state.markout.record_fill(
+                            self.state.market(), price, is_buy, mid,
+                        );
+                    } else {
+                        warn!(id = %resolved_ext_id, "Skipping markout: order not found in tracker");
+                    }
+                }
                 self.on_fill(&resolved_ext_id, price, qty, fee, is_maker);
             }
             BotEvent::PositionUpdate { market, size, entry_price, mark_price, .. } => {
@@ -167,6 +178,14 @@ impl MarketBot {
     async fn on_orderbook_update(&mut self, bids: Vec<L2Level>, asks: Vec<L2Level>, _ts: u64) {
         // Apply as snapshot (BBO stream sends full snapshots at 10ms)
         self.state.orderbook.apply_snapshot(&bids, &asks, 0);
+
+        // Evaluate pending markouts against current mid
+        if let Some(mid) = self.state.orderbook.mid() {
+            let mids = std::collections::HashMap::from([
+                (self.state.market().to_string(), mid),
+            ]);
+            self.state.markout.evaluate(&mids);
+        }
 
         // Paper mode: check for simulated fills against market BBO (P0-5)
         if let (Some(best_bid), Some(best_ask)) = (
@@ -253,7 +272,8 @@ impl MarketBot {
             panic_spread_bps: Decimal::ZERO,
             inventory_ratio,
             latency_vol_bps: Decimal::ZERO,
-            markout_adj_bps: Decimal::ZERO,
+            // Negative markout → positive adjustment → widen spread
+            markout_adj_bps: -self.state.markout.feedback_bps(self.state.market()),
             caf_multiplier: Decimal::ONE,
         };
         let spread = self.spread_calc.calculate(&spread_input);

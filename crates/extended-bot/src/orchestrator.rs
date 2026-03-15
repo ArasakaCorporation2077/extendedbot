@@ -37,19 +37,31 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
                     warn!("No API secret, using dummy signer (read-only)");
                     Arc::new(DummySigner::new(config.exchange.testnet))
                 } else {
-                    let concrete = Arc::new(DefaultStarkSigner::from_eth_key(
-                        &config.exchange.api_secret,
-                        0, // vault_id populated from account info below
-                        config.exchange.testnet,
-                    )?);
+                    // If secret starts with 0x and looks like a hex key, use it directly
+                    // as a Stark private key. Otherwise derive via grind_key.
+                    let concrete = Arc::new(
+                        if config.exchange.api_secret.starts_with("0x") {
+                            DefaultStarkSigner::from_stark_private_key(
+                                &config.exchange.api_secret,
+                                0, // vault_id populated from account info below
+                                config.exchange.testnet,
+                            )?
+                        } else {
+                            DefaultStarkSigner::from_eth_key(
+                                &config.exchange.api_secret,
+                                0,
+                                config.exchange.testnet,
+                            )?
+                        }
+                    );
 
                     // Load vault_id from account info before proceeding (P0-2)
                     let temp_rest = ExtendedRestClient::new(&config.exchange, concrete.clone());
                     match temp_rest.get_account_info().await {
                         Ok(account_info) => {
-                            if let Some(vault_id) = account_info.vault_id {
+                            if let Some(vault_id) = account_info.vault_id() {
                                 concrete.set_vault_id(vault_id);
-                                info!(vault_id, "Vault ID loaded from account info");
+                                info!(vault_id, "Vault ID loaded from account info (l2Vault)");
                             } else {
                                 error!("Account info returned no vault_id — signing will fail");
                             }
@@ -121,6 +133,7 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
     // Periodic tasks
     let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
     let mut reconcile_interval = tokio::time::interval(Duration::from_secs(60));
+    let mut markout_tick = tokio::time::interval(Duration::from_millis(50));
     let mut dms_interval = tokio::time::interval(Duration::from_secs(
         (config.trading.dead_man_switch_timeout_ms / 3000).max(10),
     ));
@@ -140,11 +153,21 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
 
             _ = cleanup_interval.tick() => {
                 bot.cleanup().await;
+                state.markout.log_summary(state.market());
             }
 
             _ = reconcile_interval.tick() => {
                 if !config.exchange.paper_trading {
                     bot.reconcile().await;
+                }
+            }
+
+            _ = markout_tick.tick() => {
+                if let Some(mid) = state.orderbook.mid() {
+                    let mids = std::collections::HashMap::from([
+                        (state.market().to_string(), mid),
+                    ]);
+                    state.markout.evaluate(&mids);
                 }
             }
 
@@ -184,29 +207,37 @@ async fn bootstrap_market_config(rest: &ExtendedRestClient, market: &str) -> (De
 
     match rest.get_markets().await {
         Ok(markets) => {
-            if let Some(m) = markets.iter().find(|m| m.market == market) {
-                if let Some(l2) = &m.l2_config {
-                    let collateral_res = l2.collateral_resolution.unwrap_or(1_000_000);
-                    let synthetic_res = l2.synthetic_resolution.unwrap_or(1_000_000_000);
-                    rest.cache_market_config(collateral_res, synthetic_res);
-                    info!(
-                        market = %market,
-                        collateral_resolution = collateral_res,
-                        synthetic_resolution = synthetic_res,
-                        "Market L2 config cached for signing"
-                    );
-                } else {
-                    warn!(market = %market, "No L2 config in market response, using defaults");
-                    rest.cache_market_config(1_000_000, 1_000_000_000);
-                }
+            if let Some(m) = markets.iter().find(|m| m.market() == market) {
+                // Starknet version: derive resolution from asset precision fields.
+                // collateralAssetPrecision=6 → 10^6 = 1_000_000
+                // assetPrecision=5 → 10^5 = 100_000
+                let collateral_res = m.collateral_asset_precision
+                    .map(|p| 10u64.pow(p))
+                    .unwrap_or(1_000_000);
+                let synthetic_res = m.asset_precision
+                    .map(|p| 10u64.pow(p))
+                    .unwrap_or(100_000);
+                rest.cache_market_config(collateral_res, synthetic_res);
+                info!(
+                    market = %market,
+                    collateral_resolution = collateral_res,
+                    synthetic_resolution = synthetic_res,
+                    "Market config cached for signing"
+                );
 
-                if let Some(tick) = m.min_price_change {
-                    tick_size = tick;
-                    info!(tick_size = %tick, "Tick size loaded");
-                }
-                if let Some(step) = m.min_trade_size {
-                    size_step = step;
-                    info!(size_step = %step, "Size step loaded");
+                if let Some(tc) = &m.trading_config {
+                    if let Some(tick_str) = &tc.min_price_change {
+                        if let Ok(tick) = tick_str.parse::<Decimal>() {
+                            tick_size = tick;
+                            info!(tick_size = %tick, "Tick size loaded");
+                        }
+                    }
+                    if let Some(step_str) = &tc.min_order_size_change {
+                        if let Ok(step) = step_str.parse::<Decimal>() {
+                            size_step = step;
+                            info!(size_step = %step, "Size step loaded");
+                        }
+                    }
                 }
             } else {
                 error!(market = %market, "Market not found in exchange market list");
@@ -308,12 +339,12 @@ async fn spawn_ws_connections(
     let mut handles = Vec::new();
     let market = config.trading.market.clone();
 
-    // BBO stream (10ms snapshots) — needed for both live and paper mode
-    let ws_bbo = ExtendedWebSocket::new(&config.exchange, WsStream::Bbo(market.clone()));
+    // Orderbook stream
+    let ws_ob = ExtendedWebSocket::new(&config.exchange, WsStream::Orderbook(market.clone()));
     let tx = event_tx.clone();
     handles.push(tokio::spawn(async move {
-        if let Err(e) = ws_bbo.run(tx).await {
-            error!(error = %e, "BBO WebSocket task exited");
+        if let Err(e) = ws_ob.run(tx).await {
+            error!(error = %e, "Orderbook WS exited");
         }
     }));
 
@@ -322,7 +353,7 @@ async fn spawn_ws_connections(
     let tx = event_tx.clone();
     handles.push(tokio::spawn(async move {
         if let Err(e) = ws_trades.run(tx).await {
-            error!(error = %e, "Trades WebSocket task exited");
+            error!(error = %e, "Trades WS exited");
         }
     }));
 
@@ -331,17 +362,17 @@ async fn spawn_ws_connections(
     let tx = event_tx.clone();
     handles.push(tokio::spawn(async move {
         if let Err(e) = ws_mark.run(tx).await {
-            error!(error = %e, "MarkPrice WebSocket task exited");
+            error!(error = %e, "MarkPrice WS exited");
         }
     }));
 
-    // Private account stream (requires API key, live mode only)
+    // Private account stream
     if !config.exchange.api_key.is_empty() && !config.exchange.paper_trading {
-        let ws_private = ExtendedWebSocket::new(&config.exchange, WsStream::Private);
+        let ws_priv = ExtendedWebSocket::new(&config.exchange, WsStream::Private);
         let tx = event_tx.clone();
         handles.push(tokio::spawn(async move {
-            if let Err(e) = ws_private.run(tx).await {
-                error!(error = %e, "Private WebSocket task exited");
+            if let Err(e) = ws_priv.run(tx).await {
+                error!(error = %e, "Private WS exited");
             }
         }));
     }

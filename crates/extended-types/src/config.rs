@@ -40,9 +40,9 @@ impl ExchangeConfig {
 
     pub fn ws_url(&self) -> &str {
         if self.testnet {
-            "wss://starknet.sepolia.extended.exchange/stream.extended.exchange/v1"
+            "wss://starknet.sepolia.extended.exchange"
         } else {
-            "wss://api.starknet.extended.exchange/stream.extended.exchange/v1"
+            "wss://app.extended.exchange"
         }
     }
 }

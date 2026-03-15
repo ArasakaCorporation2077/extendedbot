@@ -92,7 +92,9 @@ impl ExtendedRestClient {
             anyhow::bail!("Rate limited on GET /info/markets");
         }
 
-        resp.json().await.context("Failed to parse markets response")
+        let wrapper: ApiResponse<Vec<MarketResponse>> = resp.json().await
+            .context("Failed to parse markets response")?;
+        Ok(wrapper.data)
     }
 
     pub async fn get_orderbook(&self, market: &str) -> Result<OrderbookResponse> {
@@ -149,6 +151,10 @@ impl ExtendedRestClient {
         }
 
         let text = resp.text().await?;
+        // Try ApiResponse<T> wrapper first, fall back to raw T
+        if let Ok(wrapper) = serde_json::from_str::<ApiResponse<T>>(&text) {
+            return Ok(wrapper.data);
+        }
         serde_json::from_str(&text).context(format!("Failed to parse response from {}", path))
     }
 
@@ -266,13 +272,13 @@ impl ExtendedRestClient {
     async fn cancel_by_id(&self, id: &str, by_external: bool) -> Result<CancelAck> {
         self.rate_limit_wait().await;
 
-        // Extended Starknet endpoints:
-        // - By exchange ID: DELETE /api/v1/user/order?orderId={orderId}
-        // - By external ID: DELETE /api/v1/user/order?externalId={externalId}
+        // Extended API docs:
+        // - By exchange ID: DELETE /api/v1/user/order/{id}
+        // - By external ID: DELETE /api/v1/user/orders/external/{externalId}
         let url = if by_external {
-            format!("{}/api/v1/user/order?externalId={}", self.base_url, id)
+            format!("{}/api/v1/user/orders/external/{}", self.base_url, id)
         } else {
-            format!("{}/api/v1/user/order?orderId={}", self.base_url, id)
+            format!("{}/api/v1/user/order/{}", self.base_url, id)
         };
 
         let mut req = self.client.delete(&url);

@@ -11,6 +11,7 @@ use extended_exchange::order_tracker::OrderTracker;
 use extended_orderbook::LocalOrderbook;
 use extended_risk::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use extended_risk::exposure::ExposureTracker;
+use extended_risk::markout::MarkoutTracker;
 use extended_risk::position_manager::PositionManager;
 use extended_types::config::AppConfig;
 use extended_types::events::BotEvent;
@@ -25,6 +26,7 @@ pub struct BotState {
     pub position_manager: PositionManager,
     pub exposure_tracker: ExposureTracker,
     pub circuit_breaker: CircuitBreaker,
+    pub markout: MarkoutTracker,
     pub event_tx: mpsc::UnboundedSender<BotEvent>,
     pub event_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<BotEvent>>>,
     pub book_notify: watch::Sender<u64>,
@@ -60,6 +62,7 @@ impl BotState {
             position_manager: PositionManager::new(config.risk.max_position_usd),
             exposure_tracker: ExposureTracker::new(config.risk.max_position_usd),
             circuit_breaker: CircuitBreaker::new(cb_config),
+            markout: MarkoutTracker::new(500, 0.2),
             event_tx,
             event_rx: parking_lot::Mutex::new(Some(event_rx)),
             book_notify,

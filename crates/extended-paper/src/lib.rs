@@ -324,7 +324,10 @@ impl ExchangeAdapter for PaperExchange {
             equity: self.initial_balance + *self.realized_pnl.lock(),
             available_balance: *self.balance.lock(),
             initial_margin: None,
-            maintenance_margin: None,
+            unrealised_pnl: None,
+            margin_ratio: None,
+            exposure: None,
+            leverage: None,
         })
     }
 

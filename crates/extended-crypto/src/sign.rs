@@ -37,8 +37,22 @@ pub struct DefaultStarkSigner {
 
 impl DefaultStarkSigner {
     /// Create from an Ethereum private key / seed string.
+    /// Derives the Stark key via grind_key SHA-256 rejection sampling.
     pub fn from_eth_key(eth_key: &str, vault_id: u64, testnet: bool) -> Result<Self> {
         let private_key = grind_key(eth_key)?;
+        Self::from_private_key(private_key, vault_id, testnet)
+    }
+
+    /// Create directly from a StarkNet private key hex string (e.g. from x10 API Details).
+    /// Use this when the exchange gives you the Stark key directly.
+    pub fn from_stark_private_key(stark_private_hex: &str, vault_id: u64, testnet: bool) -> Result<Self> {
+        let hex = stark_private_hex.strip_prefix("0x").unwrap_or(stark_private_hex);
+        let private_key = Felt::from_hex(&format!("0x{}", hex))
+            .map_err(|e| anyhow::anyhow!("Invalid Stark private key hex: {}", e))?;
+        Self::from_private_key(private_key, vault_id, testnet)
+    }
+
+    fn from_private_key(private_key: Felt, vault_id: u64, testnet: bool) -> Result<Self> {
         let public_key = public_key_from_private(&private_key);
         let public_key_hex = format!("0x{:064x}", public_key);
         let domain = if testnet {

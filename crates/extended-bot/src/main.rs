@@ -27,10 +27,15 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load .env before anything else
-    dotenvy::dotenv().ok();
-
     let cli = Cli::parse();
+
+    // Load .env: try environment-specific file first (e.g. .env.testnet), then .env
+    let env_file = format!(".env.{}", cli.config);
+    if dotenvy::from_filename(&env_file).is_ok() {
+        eprintln!("Loaded {}", env_file);
+    } else {
+        dotenvy::dotenv().ok();
+    }
 
     // Init tracing
     tracing_subscriber::fmt()
@@ -97,8 +102,9 @@ fn load_config(name: &str) -> Result<extended_types::config::AppConfig> {
     let config_path = format!("config/{}.toml", name);
 
     let settings = config::Config::builder()
-        .add_source(config::File::with_name(&config_path).required(false))
+        // Load default first, then overlay with named config (e.g. testnet)
         .add_source(config::File::with_name("config/default").required(false))
+        .add_source(config::File::with_name(&config_path).required(false))
         .add_source(config::Environment::with_prefix("EXTENDED").separator("__"))
         .build()?;
 
