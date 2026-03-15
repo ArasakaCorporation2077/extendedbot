@@ -268,18 +268,24 @@ async fn bootstrap_state(state: &Arc<BotState>) -> Result<()> {
         Ok(positions) => {
             for pos in &positions {
                 if pos.size != Decimal::ZERO {
+                    // REST API returns absolute size + side field.
+                    // Convert to signed size (negative for short).
+                    let signed_size = match pos.side.as_deref() {
+                        Some("short") | Some("SHORT") | Some("SELL") => -pos.size.abs(),
+                        _ => pos.size.abs(), // long or default
+                    };
                     let mark = pos.mark_price.unwrap_or(pos.entry_price);
                     state.position_manager.set_position(
                         &pos.market,
-                        pos.size,
+                        signed_size,
                         pos.entry_price,
                         mark,
                     );
-                    let notional = pos.size.abs() * mark;
-                    state.exposure_tracker.update_position(&pos.market, notional * pos.size.signum());
+                    let notional = signed_size.abs() * mark;
+                    state.exposure_tracker.update_position(&pos.market, notional * signed_size.signum());
                     info!(
                         market = %pos.market,
-                        size = %pos.size,
+                        size = %signed_size,
                         entry = %pos.entry_price,
                         "Position loaded"
                     );

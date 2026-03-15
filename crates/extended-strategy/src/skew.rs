@@ -48,9 +48,10 @@ impl SkewCalculator {
 
         let (bid_price_offset, ask_price_offset) = if self.price_skew_enabled {
             let skew = bps_to_ratio(self.price_skew_bps) * nonlinear_ratio * mid_price;
-            // Long → skew>0 → raise bid (buy less), lower ask (sell more aggressively)
-            // Short → skew<0 → lower bid (buy more aggressively), raise ask (sell less)
-            (skew, -skew)
+            // Reservation price shift (Avellaneda-Stoikov):
+            // Long → skew>0 → shift both quotes down → bid lower (buy less), ask lower (sell easier)
+            // Short → skew<0 → shift both quotes up → bid higher (buy easier), ask higher (sell less)
+            (-skew, -skew)
         } else {
             (Decimal::ZERO, Decimal::ZERO)
         };
@@ -100,7 +101,7 @@ mod tests {
     fn test_long_skew() {
         let calc = SkewCalculator::new(true, dec!(15.0), true, dec!(1.5), dec!(0.1), dec!(2.0), dec!(0.8));
         let result = calc.calculate(dec!(0.5), dec!(100));
-        assert!(result.bid_price_offset > Decimal::ZERO);
+        assert!(result.bid_price_offset < Decimal::ZERO);
         assert!(result.bid_size_mult < Decimal::ONE);
         assert!(result.ask_size_mult > Decimal::ONE);
     }

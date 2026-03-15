@@ -78,6 +78,7 @@ impl ExtendedWebSocket {
         let max_backoff = Duration::from_secs(30);
 
         loop {
+            let connect_start = std::time::Instant::now();
             match self.connect_and_listen(&event_tx).await {
                 Ok(()) => {
                     info!(stream = ?self.stream, "WebSocket closed gracefully");
@@ -91,6 +92,11 @@ impl ExtendedWebSocket {
                     let _ = event_tx.send(BotEvent::ResyncRequested {
                         stream: format!("{:?}", self.stream),
                     });
+
+                    // Reset backoff if connection survived > 10s (was healthy)
+                    if connect_start.elapsed() > Duration::from_secs(10) {
+                        backoff = Duration::from_secs(1);
+                    }
 
                     warn!(backoff_ms = backoff.as_millis(), "Reconnecting after backoff");
                     tokio::time::sleep(backoff).await;
@@ -233,7 +239,7 @@ impl ExtendedWebSocket {
             price: l.p,
             size: l.c.unwrap_or(l.q),
         }).collect();
-        info!(market = %market, bids = bids.len(), asks = asks.len(), "Parsed orderbook → sending event");
+        debug!(market = %market, bids = bids.len(), asks = asks.len(), is_snapshot, "Orderbook update");
         let _ = event_tx.send(BotEvent::OrderbookUpdate { market, bids, asks, is_snapshot, ts });
     }
 

@@ -224,6 +224,9 @@ impl MarkoutTracker {
 
     /// Log a summary of markout stats for a market.
     pub fn log_summary(&self, market: &str) {
+        // Read pending count BEFORE markets lock to avoid lock order inversion
+        // (evaluate() acquires pending → markets; we must not do markets → pending)
+        let pending_count = self.pending.lock().len();
         let markets = self.markets.lock();
         if let Some(m) = markets.get(market) {
             let mut parts = Vec::new();
@@ -231,8 +234,8 @@ impl MarkoutTracker {
                 if m.ewma_initialized[h_idx] {
                     let count = m.completed[h_idx].len();
                     parts.push(format!(
-                        "{}s: {:.2}bps (n={})",
-                        horizon_ms / 1000,
+                        "{}ms: {:.2}bps (n={})",
+                        horizon_ms,
                         m.ewma_bps[h_idx],
                         count
                     ));
@@ -241,7 +244,7 @@ impl MarkoutTracker {
             if !parts.is_empty() {
                 info!(
                     market = %market,
-                    pending = self.pending.lock().len(),
+                    pending = pending_count,
                     "Markout: {}", parts.join(" | ")
                 );
             }
