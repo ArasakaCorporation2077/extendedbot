@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::Client;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use extended_crypto::{StarkSigner, OrderSignParams};
 use extended_types::config::ExchangeConfig;
@@ -14,7 +14,7 @@ use extended_types::order::OrderRequest;
 
 use crate::adapter::{ExchangeAdapter, OrderAck, CancelAck, MassCancelAck};
 use crate::rate_limiter::RateLimiter;
-use crate::rest_types::*;
+use crate::rest_types::{self, *};
 
 /// Extended Exchange REST API client.
 pub struct ExtendedRestClient {
@@ -223,26 +223,33 @@ impl ExtendedRestClient {
         let sign_params = self.build_order_sign_params(req)?;
         let signature = self.signer.sign_order(&sign_params)?;
 
+        let side_str = match req.side {
+            extended_types::order::Side::Buy => "BUY",
+            extended_types::order::Side::Sell => "SELL",
+        };
+
         let body = CreateOrderRequest {
             id: req.external_id.clone(),
             market: req.market.clone(),
-            r#type: "limit".to_string(),
-            side: req.side.to_string(),
+            r#type: "LIMIT".to_string(),
+            side: side_str.to_string(),
             qty: req.qty.to_string(),
             price: req.price.to_string(),
             fee: req.max_fee.to_string(),
             expiry_epoch_millis: req.expiry_epoch_millis,
             time_in_force: req.time_in_force.wire_value().to_string(),
             settlement: Settlement {
-                r: signature.r,
-                s: signature.s,
+                signature: SettlementSignature {
+                    r: signature.r,
+                    s: signature.s,
+                },
                 stark_key: self.signer.public_key_hex().to_string(),
-                collateral_position: self.signer.vault_id(),
+                collateral_position: self.signer.vault_id().to_string(),
             },
             post_only: if req.post_only { Some(true) } else { None },
             reduce_only: if req.reduce_only { Some(true) } else { None },
             cancel_id: req.cancel_id.clone(),
-            nonce: Some(sign_params.nonce),
+            nonce: Some(sign_params.nonce.to_string()),
         };
 
         let url = format!("{}/api/v1/user/order", self.base_url);
@@ -251,6 +258,7 @@ impl ExtendedRestClient {
             http_req = http_req.header(k, v);
         }
 
+        info!(order = %serde_json::to_string(&body).unwrap_or_default(), "Submitting order");
         let resp = http_req.json(&body).send().await
             .context("POST /user/order failed")?;
 
@@ -262,7 +270,9 @@ impl ExtendedRestClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body_text = resp.text().await.unwrap_or_default();
-            error!(status = %status, body = %body_text, "Order creation failed");
+            // Also log the request body for debugging
+            let req_json = serde_json::to_string(&body).unwrap_or_default();
+            error!(status = %status, response = %body_text, request = %req_json, "Order creation failed");
             anyhow::bail!("Order creation failed: {} - {}", status, body_text);
         }
 

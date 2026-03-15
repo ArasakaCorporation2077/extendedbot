@@ -162,13 +162,20 @@ pub struct CreateOrderResponse {
 }
 
 /// Settlement object for order signing.
+/// Format: {"signature":{"r":"0x...","s":"0x..."},"starkKey":"0x...","collateralPosition":"12345"}
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settlement {
+    pub signature: SettlementSignature,
+    pub stark_key: String,
+    /// Must be string, not number
+    pub collateral_position: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SettlementSignature {
     pub r: String,
     pub s: String,
-    pub stark_key: String,
-    pub collateral_position: u64,
 }
 
 /// Account info from GET /api/v1/user/account/info.
@@ -210,6 +217,7 @@ pub struct CreateOrderRequest {
     pub reduce_only: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancel_id: Option<String>,
+    /// Must be string, not number
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub nonce: Option<u32>,
+    pub nonce: Option<String>,
 }
