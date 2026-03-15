@@ -1,0 +1,11 @@
+[package]
+name = "extended-risk"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+extended-types = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,80 @@
+[workspace]
+members = [
+    "crates/extended-types",
+    "crates/extended-crypto",
+    "crates/extended-exchange",
+    "crates/extended-orderbook",
+    "crates/extended-risk",
+    "crates/extended-strategy",
+    "crates/extended-paper",
+    "crates/extended-bot",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Crypto (StarkNet) - only the crypto primitives, not the full SDK
+starknet-crypto = "0.8"
+starknet-types-core = "0.2"
+sha2 = "0.10"
+num-bigint = "0.4"
+hex = "0.4"
+rand = "0.8"
+
+# Decimal math
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+rust_decimal_macros = "1"
+
+# Concurrency
+dashmap = "6"
+parking_lot = "0.12"
+
+# Config
+config = "0.14"
+dotenvy = "0.15"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Async traits
+async-trait = "0.1"
+
+# IDs
+uuid = { version = "1", features = ["v4"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Internal crates
+extended-types = { path = "crates/extended-types" }
+extended-crypto = { path = "crates/extended-crypto" }
+extended-exchange = { path = "crates/extended-exchange" }
+extended-orderbook = { path = "crates/extended-orderbook" }
+extended-risk = { path = "crates/extended-risk" }
+extended-strategy = { path = "crates/extended-strategy" }
+extended-paper = { path = "crates/extended-paper" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 8
+strip = true

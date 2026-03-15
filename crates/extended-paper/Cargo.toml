@@ -1,0 +1,17 @@
+[package]
+name = "extended-paper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+extended-types = { workspace = true }
+extended-exchange = { workspace = true }
+extended-orderbook = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+chrono = { workspace = true }

@@ -1,0 +1,26 @@
+/target
+*.exe
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.*
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Secrets
+**/secrets/
+**/credentials*
+**/private_key*
+
+# Review reports (generated)
+scripts/review/reports/
