@@ -95,9 +95,9 @@ impl MarketBot {
 
     pub async fn handle_event(&mut self, event: BotEvent) {
         match event {
-            BotEvent::OrderbookUpdate { market, bids, asks, ts } => {
+            BotEvent::OrderbookUpdate { market, bids, asks, is_snapshot, ts } => {
                 if market == self.state.market() {
-                    self.on_orderbook_update(bids, asks, ts).await;
+                    self.on_orderbook_update(bids, asks, is_snapshot, ts).await;
                 }
             }
             BotEvent::TradeUpdate { market, trades } => {
@@ -175,9 +175,13 @@ impl MarketBot {
         }
     }
 
-    async fn on_orderbook_update(&mut self, bids: Vec<L2Level>, asks: Vec<L2Level>, _ts: u64) {
-        // Apply as snapshot (BBO stream sends full snapshots at 10ms)
-        self.state.orderbook.apply_snapshot(&bids, &asks, 0);
+    async fn on_orderbook_update(&mut self, bids: Vec<L2Level>, asks: Vec<L2Level>, is_snapshot: bool, _ts: u64) {
+        if is_snapshot {
+            self.state.orderbook.apply_snapshot(&bids, &asks, 0);
+            debug!(bids = bids.len(), asks = asks.len(), "Applied orderbook snapshot");
+        } else {
+            self.state.orderbook.apply_delta(&bids, &asks, 0);
+        }
 
         // Evaluate pending markouts against current mid
         if let Some(mid) = self.state.orderbook.mid() {
@@ -202,12 +206,12 @@ impl MarketBot {
         // Calculate fair price
         let mid = match self.state.orderbook.mid() {
             Some(m) => m,
-            None => return,
+            None => { debug!("No mid price, skipping strategy"); return; }
         };
 
         let fp = match self.fair_price_calc.update_local_mid(mid) {
             Some(fp) => fp,
-            None => return,
+            None => { debug!(mid = %mid, "EWMA warming up"); return; }
         };
 
         // Fast cancel check
@@ -219,6 +223,7 @@ impl MarketBot {
         let threshold = Decimal::try_from(self.state.config.trading.update_threshold_bps).unwrap_or(dec!(3.0));
 
         if self.last_requote.elapsed() >= min_interval && price_change >= threshold {
+            info!(fair_price = %fp, mid = %mid, change_bps = %price_change, "Requoting");
             self.requote(fp).await;
         }
     }

@@ -48,13 +48,17 @@ pub struct WsOrderbookData {
     pub a: Vec<WsOrderbookLevel>,
 }
 
-/// Single price level: `{ "p": "50000.0", "q": "0.1" }`
+/// Single price level: `{ "p": "50000.0", "q": "0.1", "c": "0.3" }`
+/// For snapshots, q = absolute size, c = absolute size (same).
+/// For deltas, q = change in size, c = absolute size after change.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WsOrderbookLevel {
     /// Price (string-encoded decimal)
     pub p: Decimal,
-    /// Quantity (string-encoded decimal)
+    /// Quantity — snapshot: absolute, delta: change
     pub q: Decimal,
+    /// Absolute size (available in both snapshot and delta)
+    pub c: Option<Decimal>,
 }
 
 // === Public trades ===

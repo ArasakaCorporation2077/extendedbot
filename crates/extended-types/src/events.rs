@@ -11,6 +11,7 @@ pub enum BotEvent {
         market: String,
         bids: Vec<L2Level>,
         asks: Vec<L2Level>,
+        is_snapshot: bool,
         ts: u64,
     },
     TradeUpdate {

@@ -141,11 +141,13 @@ impl ExtendedWebSocket {
                         Some(Ok(Message::Text(text))) => {
                             self.handle_message(&text, event_tx);
                         }
+                        Some(Ok(Message::Binary(_))) => {}
                         Some(Ok(Message::Ping(data))) => {
                             write.send(Message::Pong(data)).await.ok();
                         }
-                        Some(Ok(Message::Close(_))) => {
-                            info!(stream = ?self.stream, "WebSocket server sent close frame");
+                        Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(Message::Close(frame))) => {
+                            info!(stream = ?self.stream, frame = ?frame, "WS CLOSE received");
                             break;
                         }
                         Some(Err(e)) => {
@@ -182,7 +184,7 @@ impl ExtendedWebSocket {
         let envelope: WsEnvelope = match serde_json::from_str(text) {
             Ok(env) => env,
             Err(e) => {
-                debug!(error = %e, raw = &text[..text.len().min(200)], "Failed to parse WS envelope");
+                warn!(error = %e, raw = &text[..text.len().min(200)], "Failed to parse WS envelope");
                 return;
             }
         };
@@ -203,23 +205,36 @@ impl ExtendedWebSocket {
 
         // Route by stream type
         match &self.stream {
-            WsStream::Orderbook(_) => self.handle_orderbook(envelope.data, ts, event_tx),
+            WsStream::Orderbook(_) => self.handle_orderbook(envelope.msg_type.as_deref(), envelope.data, ts, event_tx),
             WsStream::Trades(_) => self.handle_trades(envelope.data, ts, event_tx),
             WsStream::MarkPrice(_) => self.handle_mark_price(envelope.data, event_tx),
             WsStream::Private => self.handle_private(envelope.msg_type.as_deref(), envelope.data, ts, event_tx),
         }
     }
 
-    fn handle_orderbook(&self, data: serde_json::Value, ts: u64, event_tx: &mpsc::UnboundedSender<BotEvent>) {
-        let ob: WsOrderbookData = match serde_json::from_value(data) {
+    fn handle_orderbook(&self, msg_type: Option<&str>, data: serde_json::Value, ts: u64, event_tx: &mpsc::UnboundedSender<BotEvent>) {
+        let ob: WsOrderbookData = match serde_json::from_value(data.clone()) {
             Ok(d) => d,
-            Err(e) => { debug!(error = %e, "Failed to parse orderbook data"); return; }
+            Err(e) => {
+                let s = data.to_string();
+                warn!(error = %e, sample = &s[..s.len().min(300)], "Failed to parse orderbook data");
+                return;
+            }
         };
 
+        let is_snapshot = matches!(msg_type, Some("SNAPSHOT"));
         let market = ob.m.unwrap_or_else(|| self.fallback_market());
-        let bids = ob.b.iter().map(|l| L2Level { price: l.p, size: l.q }).collect();
-        let asks = ob.a.iter().map(|l| L2Level { price: l.p, size: l.q }).collect();
-        let _ = event_tx.send(BotEvent::OrderbookUpdate { market, bids, asks, ts });
+        // Use "c" (absolute size) field if available, otherwise fall back to "q"
+        let bids: Vec<L2Level> = ob.b.iter().map(|l| L2Level {
+            price: l.p,
+            size: l.c.unwrap_or(l.q),
+        }).collect();
+        let asks: Vec<L2Level> = ob.a.iter().map(|l| L2Level {
+            price: l.p,
+            size: l.c.unwrap_or(l.q),
+        }).collect();
+        info!(market = %market, bids = bids.len(), asks = asks.len(), "Parsed orderbook → sending event");
+        let _ = event_tx.send(BotEvent::OrderbookUpdate { market, bids, asks, is_snapshot, ts });
     }
 
     fn handle_trades(&self, data: serde_json::Value, _ts: u64, event_tx: &mpsc::UnboundedSender<BotEvent>) {
