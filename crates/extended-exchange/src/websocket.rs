@@ -39,6 +39,8 @@ pub enum WsStream {
 /// Each instance connects to a single stream URL.
 pub struct ExtendedWebSocket {
     base_ws_url: String,
+    /// Private WS uses api host (X-Api-Key auth), public uses app host
+    api_ws_url: String,
     api_key: String,
     user_agent: String,
     stream: WsStream,
@@ -47,8 +49,14 @@ pub struct ExtendedWebSocket {
 
 impl ExtendedWebSocket {
     pub fn new(config: &ExchangeConfig, stream: WsStream) -> Self {
+        // Private WS: api host supports X-Api-Key
+        // Public WS: app host serves data streams
+        let api_host = config.rest_base_url()
+            .replace("https://", "wss://")
+            .replace("http://", "ws://");
         Self {
             base_ws_url: config.ws_url().to_string(),
+            api_ws_url: api_host,
             api_key: config.api_key.clone(),
             user_agent: config.user_agent.clone(),
             stream,
@@ -57,12 +65,17 @@ impl ExtendedWebSocket {
     }
 
     fn stream_url(&self) -> String {
-        let base = self.base_ws_url.trim_end_matches('/');
         let path = match &self.stream {
             WsStream::Orderbook(market) => format!("/stream.extended.exchange/v1/orderbooks/{}", market),
             WsStream::Trades(market) => format!("/stream.extended.exchange/v1/publicTrades/{}", market),
             WsStream::MarkPrice(market) => format!("/stream.extended.exchange/v1/prices/mark/{}", market),
             WsStream::Private => "/stream.extended.exchange/v1/account".to_string(),
+        };
+        // Private uses api host, public uses app host
+        let base = if self.needs_auth() {
+            self.api_ws_url.trim_end_matches('/')
+        } else {
+            self.base_ws_url.trim_end_matches('/')
         };
         format!("{}{}?keepAlive=true", base, path)
     }

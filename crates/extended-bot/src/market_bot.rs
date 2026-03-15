@@ -164,7 +164,11 @@ impl MarketBot {
             }
             BotEvent::WsDisconnected { reason } => {
                 warn!(reason = %reason, "WebSocket disconnected");
-                self.emergency_cancel().await;
+                // Only emergency cancel if a market data stream disconnects.
+                // Private WS disconnect is not critical — REST polling covers it.
+                if reason.contains("Orderbook") || reason.contains("MarkPrice") {
+                    self.emergency_cancel().await;
+                }
             }
             BotEvent::ResyncRequested { stream } => {
                 warn!(stream = %stream, "Resync requested after reconnect — state may be stale");
