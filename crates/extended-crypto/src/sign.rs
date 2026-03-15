@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
+use num_bigint::BigUint;
 use rand::RngCore;
 use starknet_crypto::Felt;
 
@@ -61,16 +62,23 @@ impl DefaultStarkSigner {
     }
 
     /// Generate a cryptographically random k value for ECDSA signing.
-    /// k must be in [1, n-1] where n is the StarkCurve order (~252 bits).
+    /// k must be in [1, n-1] where n is the StarkCurve order.
+    /// Uses rejection sampling to guarantee k < EC_ORDER.
     fn random_k() -> Felt {
+        const EC_ORDER_HEX: &str = "0800000000000010ffffffffffffffffb781126dcae7b2321e66a241adc64d2f";
+        let ec_order = BigUint::parse_bytes(EC_ORDER_HEX.as_bytes(), 16)
+            .expect("Failed to parse EC_ORDER");
+
         let mut rng = rand::thread_rng();
-        let mut k_bytes = [0u8; 32];
-        rng.fill_bytes(&mut k_bytes);
-        // Mask top bits to stay within StarkCurve order (~252 bits)
-        k_bytes[0] &= 0x03;
-        let k = Felt::from_bytes_be(&k_bytes);
-        // k must be non-zero
-        if k == Felt::ZERO { Felt::ONE } else { k }
+        loop {
+            let mut k_bytes = [0u8; 32];
+            rng.fill_bytes(&mut k_bytes);
+            let k_int = BigUint::from_bytes_be(&k_bytes);
+
+            if k_int > BigUint::ZERO && k_int < ec_order {
+                return Felt::from_bytes_be(&k_bytes);
+            }
+        }
     }
 }
 

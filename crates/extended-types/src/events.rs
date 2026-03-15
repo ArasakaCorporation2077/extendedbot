@@ -71,5 +71,8 @@ pub enum BotEvent {
     WsDisconnected {
         reason: String,
     },
+    ResyncRequested {
+        stream: String,
+    },
     Shutdown,
 }

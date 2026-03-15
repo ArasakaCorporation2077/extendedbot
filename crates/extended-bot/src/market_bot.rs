@@ -155,6 +155,9 @@ impl MarketBot {
                 warn!(reason = %reason, "WebSocket disconnected");
                 self.emergency_cancel().await;
             }
+            BotEvent::ResyncRequested { stream } => {
+                warn!(stream = %stream, "Resync requested after reconnect — state may be stale");
+            }
             BotEvent::Shutdown => {
                 info!("Shutdown event received");
             }

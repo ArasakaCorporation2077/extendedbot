@@ -54,14 +54,14 @@ impl OrderTracker {
                 return false;
             }
 
-            // Validate transition (but accept it anyway - WS is source of truth)
             if !order.status.can_transition_to(new_status) {
-                tracing::warn!(
+                tracing::error!(
                     external_id = %external_id,
                     from = %order.status,
                     to = %new_status,
-                    "Invalid order state transition (accepting anyway - WS is truth)"
+                    "Invalid order state transition — rejecting update"
                 );
+                return false;
             }
 
             order.status = new_status;
@@ -130,12 +130,29 @@ impl OrderTracker {
             }
         }
 
-        for id in to_remove {
-            if let Some((_, order)) = self.by_external_id.remove(&id) {
+        for id in &to_remove {
+            if let Some((_, order)) = self.by_external_id.remove(id) {
                 if let Some(eid) = &order.exchange_id {
                     self.by_exchange_id.remove(eid);
                 }
             }
+        }
+
+        if !stale.is_empty() || !to_remove.is_empty() {
+            tracing::info!(
+                ghost_cancelled = stale.len(),
+                terminal_removed = to_remove.len(),
+                remaining = self.by_external_id.len(),
+                "OrderTracker cleanup"
+            );
+        }
+
+        // Warn if tracker is growing too large
+        if self.by_external_id.len() > 10_000 {
+            tracing::warn!(
+                total = self.by_external_id.len(),
+                "OrderTracker map growing large — increase cleanup frequency"
+            );
         }
     }
 

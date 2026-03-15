@@ -7,6 +7,7 @@
 //! - Mark price, Index price, Funding
 //! - Private account updates
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -48,6 +49,7 @@ pub struct ExtendedWebSocket {
     api_key: String,
     user_agent: String,
     stream: WsStream,
+    last_seq: AtomicU64,
 }
 
 impl ExtendedWebSocket {
@@ -57,6 +59,7 @@ impl ExtendedWebSocket {
             api_key: config.api_key.clone(),
             user_agent: config.user_agent.clone(),
             stream,
+            last_seq: AtomicU64::new(0),
         }
     }
 
@@ -95,6 +98,10 @@ impl ExtendedWebSocket {
                     let _ = event_tx.send(BotEvent::WsDisconnected {
                         reason: format!("{:?}: {}", self.stream, e),
                     });
+                    // Request full state resync after reconnect to avoid stale data
+                    let _ = event_tx.send(BotEvent::ResyncRequested {
+                        stream: format!("{:?}", self.stream),
+                    });
 
                     warn!(backoff_ms = backoff.as_millis(), "Reconnecting after backoff");
                     tokio::time::sleep(backoff).await;
@@ -125,6 +132,8 @@ impl ExtendedWebSocket {
             .context(format!("WebSocket connection failed: {}", url))?;
 
         info!(url = %url, "WebSocket connected");
+        // Reset sequence tracking on new connection
+        self.last_seq.store(0, Ordering::SeqCst);
         let _ = event_tx.send(BotEvent::WsConnected);
 
         let (mut write, mut read) = ws_stream.split();
@@ -200,11 +209,26 @@ impl ExtendedWebSocket {
         }
     }
 
-    /// Parse the universal envelope and extract the data field.
+    /// Parse the universal envelope, validate sequence number, and extract data.
     fn parse_envelope(&self, text: &str) -> Option<(WsEnvelope, u64)> {
         match serde_json::from_str::<WsEnvelope>(text) {
             Ok(env) => {
                 let ts = env.ts.unwrap_or(0);
+
+                // Validate sequence number to detect gaps
+                if let Some(seq) = env.seq {
+                    let prev = self.last_seq.swap(seq, Ordering::SeqCst);
+                    if prev > 0 && seq != prev + 1 {
+                        warn!(
+                            stream = ?self.stream,
+                            expected = prev + 1,
+                            got = seq,
+                            gap = seq.saturating_sub(prev + 1),
+                            "WS sequence gap detected — possible missed messages"
+                        );
+                    }
+                }
+
                 Some((env, ts))
             }
             Err(e) => {

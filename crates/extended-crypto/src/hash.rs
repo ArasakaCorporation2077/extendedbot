@@ -114,13 +114,16 @@ fn compute_order_type_hash() -> Felt {
 }
 
 /// Scale a decimal amount by resolution, rounding up or down.
+/// Panics if the scaled value overflows u64 — this is intentional to prevent
+/// silently signing orders with zero amounts.
 fn scale_amount(amount: Decimal, resolution: u64, round_up: bool) -> u64 {
     let scaled = amount * Decimal::from(resolution);
-    if round_up {
-        scaled.ceil().to_string().parse::<u64>().unwrap_or(0)
-    } else {
-        scaled.floor().to_string().parse::<u64>().unwrap_or(0)
-    }
+    let rounded = if round_up { scaled.ceil() } else { scaled.floor() };
+    rounded.to_string().parse::<u64>()
+        .unwrap_or_else(|_| panic!(
+            "scale_amount overflow: {} * {} = {} does not fit u64",
+            amount, resolution, rounded
+        ))
 }
 
 /// Convert a short string (up to 31 bytes) to a Felt.

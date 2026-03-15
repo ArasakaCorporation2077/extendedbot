@@ -145,16 +145,22 @@ impl PaperExchange {
             let direction = if old_size > Decimal::ZERO { Decimal::ONE } else { dec!(-1) };
             let realized = closed_size * (price - pos.entry_price) * direction;
             *self.realized_pnl.lock() += realized;
+
+            if pos.size.is_zero() {
+                // Fully closed — reset entry price
+                pos.entry_price = Decimal::ZERO;
+            } else if (old_size > Decimal::ZERO && pos.size < Decimal::ZERO)
+                || (old_size < Decimal::ZERO && pos.size > Decimal::ZERO)
+            {
+                // Position flipped sides — new entry at fill price
+                pos.entry_price = price;
+            }
         }
 
         if !is_reducing && !pos.size.is_zero() {
             let old_notional = old_size.abs() * pos.entry_price;
             let new_notional = qty * price;
             pos.entry_price = (old_notional + new_notional) / pos.size.abs();
-        } else if (old_size > Decimal::ZERO && pos.size < Decimal::ZERO)
-            || (old_size < Decimal::ZERO && pos.size > Decimal::ZERO)
-        {
-            pos.entry_price = price;
         }
     }
 
@@ -323,7 +329,8 @@ impl ExchangeAdapter for PaperExchange {
     }
 
     fn check_fills(&self, market: &str, market_bid: Decimal, market_ask: Decimal) {
-        self.check_fills(market, market_bid, market_ask);
+        // Call the inherent method, not this trait method (avoid infinite recursion)
+        PaperExchange::check_fills(self, market, market_bid, market_ask);
     }
 }
 

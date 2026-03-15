@@ -21,6 +21,3 @@ Desktop.ini
 **/secrets/
 **/credentials*
 **/private_key*
-
-# Review reports (generated)
-scripts/review/reports/
