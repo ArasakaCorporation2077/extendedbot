@@ -94,8 +94,10 @@ impl ExtendedWebSocket {
             let connect_start = std::time::Instant::now();
             match self.connect_and_listen(&event_tx).await {
                 Ok(()) => {
-                    info!(stream = ?self.stream, "WebSocket closed gracefully");
-                    break;
+                    // Server sends "Session timeout" close — auto-reconnect
+                    info!(stream = ?self.stream, "WebSocket closed, reconnecting");
+                    backoff = Duration::from_secs(1);
+                    continue;
                 }
                 Err(e) => {
                     error!(error = %e, stream = ?self.stream, "WebSocket disconnected");
@@ -131,6 +133,14 @@ impl ExtendedWebSocket {
             .context("Failed to build WS request")?;
         request.headers_mut().insert("User-Agent",
             self.user_agent.parse().unwrap_or_else(|_| "extended-mm".parse().unwrap()));
+        // Origin header required for keepAlive to work
+        let origin = if self.needs_auth() {
+            self.api_ws_url.replace("wss://", "https://").replace("ws://", "http://")
+        } else {
+            self.base_ws_url.replace("wss://", "https://").replace("ws://", "http://")
+        };
+        request.headers_mut().insert("Origin",
+            origin.parse().unwrap_or_else(|_| "https://app.extended.exchange".parse().unwrap()));
         if self.needs_auth() {
             request.headers_mut().insert("X-Api-Key",
                 self.api_key.parse().unwrap_or_else(|_| "".parse().unwrap()));
@@ -149,15 +159,25 @@ impl ExtendedWebSocket {
 
         let (mut write, mut read) = ws_stream.split();
 
-        // Server pings every 15s, expects pong within 10s.
-        // We also send pings every 30s as a keepalive.
-        let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+        // Server expects JSON ping to keep connection alive.
+        // Send immediately, then every 5s.
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut ping_id: u64 = 0;
+
+        // First ping immediately
+        write.send(Message::Text("{\"id\":\"0\",\"method\":\"ping\"}".into())).await.ok();
+        ping_id += 1;
 
         loop {
             tokio::select! {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
+                            // Skip JSON-RPC ping responses
+                            if text.contains("\"method\":\"ping\"") && text.contains("\"result\"") {
+                                continue;
+                            }
                             self.handle_message(&text, event_tx);
                         }
                         Some(Ok(Message::Binary(_))) => {}
@@ -179,7 +199,13 @@ impl ExtendedWebSocket {
                     }
                 }
                 _ = ping_interval.tick() => {
-                    write.send(Message::Ping(vec![].into())).await.ok();
+                    let ping = format!("{{\"id\":\"{}\",\"method\":\"ping\"}}", ping_id);
+                    ping_id += 1;
+                    debug!(stream = ?self.stream, id = ping_id, "Sending JSON ping");
+                    if let Err(e) = write.send(Message::Text(ping.into())).await {
+                        error!(stream = ?self.stream, error = %e, "Failed to send JSON ping");
+                        break;
+                    }
                 }
             }
         }

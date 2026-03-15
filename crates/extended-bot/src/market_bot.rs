@@ -225,9 +225,11 @@ impl MarketBot {
         let min_interval = Duration::from_millis(self.state.config.trading.min_requote_interval_ms);
         let price_change = self.fair_price_calc.price_change_bps(mid);
         let threshold = Decimal::try_from(self.state.config.trading.update_threshold_bps).unwrap_or(dec!(3.0));
+        let has_live_orders = self.state.order_tracker.live_count() > 0;
 
-        if self.last_requote.elapsed() >= min_interval && price_change >= threshold {
-            info!(fair_price = %fp, mid = %mid, change_bps = %price_change, "Requoting");
+        // Requote if: price moved enough, OR we have no live orders (need initial quotes)
+        if self.last_requote.elapsed() >= min_interval && (price_change >= threshold || !has_live_orders) {
+            info!(fair_price = %fp, mid = %mid, change_bps = %price_change, has_orders = has_live_orders, "Requoting");
             self.requote(fp).await;
         }
     }
