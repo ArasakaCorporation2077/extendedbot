@@ -30,6 +30,7 @@ struct PendingFill {
     fill_price: Decimal,
     is_buy: bool,
     mid_at_fill: Decimal,
+    binance_mid_at_fill: Decimal,
     filled_at: Instant,
     evaluated: [bool; 5],
 }
@@ -37,13 +38,17 @@ struct PendingFill {
 /// Completed markout result in basis points.
 #[derive(Debug, Clone, Copy)]
 struct CompletedMarkout {
-    bps: f64,
+    raw_bps: f64,
+    adjusted_bps: f64,
 }
 
 /// Per-market markout history with EWMA tracking.
 struct MarketMarkout {
     completed: [VecDeque<CompletedMarkout>; 5],
-    ewma_bps: [f64; 5],
+    /// EWMA of raw markout (x10 mid based)
+    ewma_raw_bps: [f64; 5],
+    /// EWMA of adjusted markout (Binance-corrected)
+    ewma_adj_bps: [f64; 5],
     ewma_initialized: [bool; 5],
 }
 
@@ -51,7 +56,8 @@ impl MarketMarkout {
     fn new() -> Self {
         Self {
             completed: std::array::from_fn(|_| VecDeque::new()),
-            ewma_bps: [0.0; 5],
+            ewma_raw_bps: [0.0; 5],
+            ewma_adj_bps: [0.0; 5],
             ewma_initialized: [false; 5],
         }
     }
@@ -83,6 +89,7 @@ impl MarkoutTracker {
         fill_price: Decimal,
         is_buy: bool,
         current_mid: Decimal,
+        binance_mid: Decimal,
     ) {
         if current_mid.is_zero() {
             debug!(market = %market, "Skipping markout record: mid price is zero");
@@ -94,6 +101,7 @@ impl MarkoutTracker {
             fill_price,
             is_buy,
             mid_at_fill: current_mid,
+            binance_mid_at_fill: binance_mid,
             filled_at: Instant::now(),
             evaluated: [false; 5],
         });
@@ -101,7 +109,13 @@ impl MarkoutTracker {
 
     /// Evaluate pending fills against current mid prices.
     /// Call this on a periodic tick (e.g., every 100ms–500ms).
-    pub fn evaluate(&self, current_mids: &HashMap<String, Decimal>) {
+    /// Evaluate pending fills against current mid prices.
+    /// `current_binance_mids` is used for adjusted markout (removes market-wide movement).
+    pub fn evaluate(
+        &self,
+        current_mids: &HashMap<String, Decimal>,
+        current_binance_mids: &HashMap<String, Decimal>,
+    ) {
         let mut pending = self.pending.lock();
         let mut markets = self.markets.lock();
 
@@ -113,38 +127,57 @@ impl MarkoutTracker {
                 Some(m) if !m.is_zero() => *m,
                 _ => continue,
             };
+            let current_binance_mid = current_binance_mids
+                .get(&fill.market).copied().unwrap_or(Decimal::ZERO);
 
             for (h_idx, &horizon_ms) in HORIZONS_MS.iter().enumerate() {
                 if fill.evaluated[h_idx] || elapsed_ms < horizon_ms {
                     continue;
                 }
 
-                // Calculate markout: positive = good fill
+                // Raw markout: x10 mid movement in our favor
                 let raw = if fill.is_buy {
                     current_mid - fill.fill_price
                 } else {
                     fill.fill_price - current_mid
                 };
+                let raw_bps = to_bps(raw, fill.fill_price);
 
-                let bps = to_bps(raw, fill.fill_price);
+                // Adjusted markout: subtract Binance market-wide movement
+                // Isolates our execution quality from general market drift
+                let adjusted_bps = if !fill.binance_mid_at_fill.is_zero()
+                    && !current_binance_mid.is_zero()
+                {
+                    let market_move = if fill.is_buy {
+                        current_binance_mid - fill.binance_mid_at_fill
+                    } else {
+                        fill.binance_mid_at_fill - current_binance_mid
+                    };
+                    to_bps(raw - market_move, fill.fill_price)
+                } else {
+                    raw_bps
+                };
 
                 let market_data = markets
                     .entry(fill.market.clone())
                     .or_insert_with(MarketMarkout::new);
 
                 // Store completed markout
-                market_data.completed[h_idx].push_back(CompletedMarkout { bps });
+                market_data.completed[h_idx].push_back(CompletedMarkout { raw_bps, adjusted_bps });
                 if market_data.completed[h_idx].len() > self.max_history {
                     market_data.completed[h_idx].pop_front();
                 }
 
-                // Update EWMA
+                // Update EWMA for both raw and adjusted
                 if market_data.ewma_initialized[h_idx] {
-                    market_data.ewma_bps[h_idx] = market_data.ewma_bps[h_idx]
-                        * (1.0 - self.ewma_alpha)
-                        + bps * self.ewma_alpha;
+                    let a = self.ewma_alpha;
+                    market_data.ewma_raw_bps[h_idx] =
+                        market_data.ewma_raw_bps[h_idx] * (1.0 - a) + raw_bps * a;
+                    market_data.ewma_adj_bps[h_idx] =
+                        market_data.ewma_adj_bps[h_idx] * (1.0 - a) + adjusted_bps * a;
                 } else {
-                    market_data.ewma_bps[h_idx] = bps;
+                    market_data.ewma_raw_bps[h_idx] = raw_bps;
+                    market_data.ewma_adj_bps[h_idx] = adjusted_bps;
                     market_data.ewma_initialized[h_idx] = true;
                 }
 
@@ -153,8 +186,10 @@ impl MarkoutTracker {
                 debug!(
                     market = %fill.market,
                     horizon_ms = horizon_ms,
-                    bps = format!("{:.2}", bps),
-                    ewma = format!("{:.2}", market_data.ewma_bps[h_idx]),
+                    raw_bps = format!("{:.2}", raw_bps),
+                    adj_bps = format!("{:.2}", adjusted_bps),
+                    ewma_raw = format!("{:.2}", market_data.ewma_raw_bps[h_idx]),
+                    ewma_adj = format!("{:.2}", market_data.ewma_adj_bps[h_idx]),
                     "Markout evaluated"
                 );
             }
@@ -182,37 +217,35 @@ impl MarkoutTracker {
         }
     }
 
-    /// Get EWMA markout in bps for a specific market and horizon.
-    pub fn ewma_bps(&self, market: &str, horizon_ms: u64) -> Option<f64> {
+    /// Get EWMA adjusted markout in bps (Binance-corrected) for a market and horizon.
+    pub fn ewma_adj_bps(&self, market: &str, horizon_ms: u64) -> Option<f64> {
         let h_idx = horizon_index(horizon_ms)?;
         let markets = self.markets.lock();
         let m = markets.get(market)?;
         if m.ewma_initialized[h_idx] {
-            Some(m.ewma_bps[h_idx])
+            Some(m.ewma_adj_bps[h_idx])
         } else {
             None
         }
     }
 
-    /// Get average markout in bps for a specific market and horizon.
-    pub fn avg_bps(&self, market: &str, horizon_ms: u64) -> Option<f64> {
+    /// Get EWMA raw markout in bps (x10 mid only) for a market and horizon.
+    pub fn ewma_raw_bps(&self, market: &str, horizon_ms: u64) -> Option<f64> {
         let h_idx = horizon_index(horizon_ms)?;
         let markets = self.markets.lock();
         let m = markets.get(market)?;
-        let data = &m.completed[h_idx];
-        if data.is_empty() {
-            return None;
+        if m.ewma_initialized[h_idx] {
+            Some(m.ewma_raw_bps[h_idx])
+        } else {
+            None
         }
-        let sum: f64 = data.iter().map(|c| c.bps).sum();
-        Some(sum / data.len() as f64)
     }
 
-    /// Get the 5-second EWMA markout for spread feedback.
-    /// Returns Decimal for direct use in spread calculation.
+    /// Get the 5-second EWMA adjusted markout for spread feedback.
+    /// Uses Binance-adjusted markout to isolate execution quality from market drift.
     pub fn feedback_bps(&self, market: &str) -> Decimal {
-        // Prefer 5s EWMA, fall back to 1s
-        let bps = self.ewma_bps(market, 5_000)
-            .or_else(|| self.ewma_bps(market, 1_000))
+        let bps = self.ewma_adj_bps(market, 5_000)
+            .or_else(|| self.ewma_adj_bps(market, 1_000))
             .unwrap_or(0.0);
         Decimal::try_from(bps).unwrap_or(Decimal::ZERO)
     }
@@ -234,9 +267,10 @@ impl MarkoutTracker {
                 if m.ewma_initialized[h_idx] {
                     let count = m.completed[h_idx].len();
                     parts.push(format!(
-                        "{}ms: {:.2}bps (n={})",
+                        "{}ms: raw={:.2}bps adj={:.2}bps (n={})",
                         horizon_ms,
-                        m.ewma_bps[h_idx],
+                        m.ewma_raw_bps[h_idx],
+                        m.ewma_adj_bps[h_idx],
                         count
                     ));
                 }
@@ -268,16 +302,7 @@ mod tests {
     fn test_markout_buy_favorable() {
         let tracker = MarkoutTracker::new(100, 0.2);
         // Buy at 100, mid was 100
-        tracker.record_fill("BTC-USD", dec!(100), true, dec!(100));
-
-        // Simulate 1s later: mid moved to 101 (favorable for buyer)
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
-        // Force evaluate by manipulating time (in real code, Instant is used)
-        // For unit test, we just verify the structure
-        let mids: HashMap<String, Decimal> = [("BTC-USD".to_string(), dec!(101))].into();
-        // Can't easily test time-based evaluation in unit test without mocking
-        // Just verify recording works
+        tracker.record_fill("BTC-USD", dec!(100), true, dec!(100), dec!(100));
         assert_eq!(tracker.pending_count(), 1);
     }
 
@@ -285,7 +310,7 @@ mod tests {
     fn test_markout_no_mid() {
         let tracker = MarkoutTracker::new(100, 0.2);
         // Should skip when mid is zero
-        tracker.record_fill("BTC-USD", dec!(100), true, Decimal::ZERO);
+        tracker.record_fill("BTC-USD", dec!(100), true, Decimal::ZERO, dec!(100));
         assert_eq!(tracker.pending_count(), 0);
     }
 

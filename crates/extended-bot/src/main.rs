@@ -12,10 +12,6 @@ mod state;
 #[derive(Parser, Debug)]
 #[command(name = "extended-mm", about = "Extended Exchange Market Maker")]
 struct Cli {
-    /// Config overlay name (loads config/{name}.toml)
-    #[arg(long, default_value = "default")]
-    config: String,
-
     /// Force paper trading mode (no live orders)
     #[arg(long)]
     paper: bool,
@@ -23,19 +19,17 @@ struct Cli {
     /// Smoke mode: connect + log, but never send orders
     #[arg(long)]
     smoke: bool,
+
+    /// Close all positions and exit
+    #[arg(long)]
+    close: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Load .env: try environment-specific file first (e.g. .env.testnet), then .env
-    let env_file = format!(".env.{}", cli.config);
-    if dotenvy::from_filename(&env_file).is_ok() {
-        eprintln!("Loaded {}", env_file);
-    } else {
-        dotenvy::dotenv().ok();
-    }
+    dotenvy::dotenv().ok();
 
     // Init tracing
     tracing_subscriber::fmt()
@@ -49,14 +43,13 @@ async fn main() -> Result<()> {
         .init();
 
     info!(
-        config = %cli.config,
         paper = cli.paper,
         smoke = cli.smoke,
         "Starting extended-mm"
     );
 
     // Load config
-    let mut app_config = load_config(&cli.config)?;
+    let mut app_config = load_config()?;
 
     // Override from env
     if let Ok(key) = std::env::var("EXTENDED_API_KEY") {
@@ -86,6 +79,16 @@ async fn main() -> Result<()> {
         info!("*** SMOKE MODE - Observe only, no orders ***");
     }
 
+    // Close mode: close all positions and exit
+    if cli.close {
+        info!("*** CLOSE MODE - Closing all positions ***");
+        match orchestrator::close_all(app_config).await {
+            Ok(()) => info!("Positions closed"),
+            Err(e) => error!(error = %e, "Failed to close positions"),
+        }
+        return Ok(());
+    }
+
     // Run the orchestrator
     match orchestrator::run(app_config, cli.smoke).await {
         Ok(()) => info!("Shutdown complete"),
@@ -98,13 +101,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn load_config(name: &str) -> Result<extended_types::config::AppConfig> {
-    let config_path = format!("config/{}.toml", name);
-
+fn load_config() -> Result<extended_types::config::AppConfig> {
     let settings = config::Config::builder()
-        // Load default first, then overlay with named config (e.g. testnet)
-        .add_source(config::File::with_name("config/default").required(false))
-        .add_source(config::File::with_name(&config_path).required(false))
+        .add_source(config::File::with_name("config/default").required(true))
         .add_source(config::Environment::with_prefix("EXTENDED").separator("__"))
         .build()?;
 

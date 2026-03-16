@@ -1,7 +1,44 @@
 //! REST API response types for Extended Exchange.
 
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Deserialize a Decimal from either a string or a number.
+/// The Extended Exchange API returns some numeric fields as strings (e.g. "0.00135").
+fn deserialize_decimal_from_str<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+
+    struct DecimalVisitor;
+
+    impl<'de> de::Visitor<'de> for DecimalVisitor {
+        type Value = Decimal;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a decimal number or string")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Decimal, E> {
+            v.parse::<Decimal>().map_err(de::Error::custom)
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Decimal, E> {
+            Decimal::try_from(v).map_err(de::Error::custom)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Decimal, E> {
+            Ok(Decimal::from(v))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Decimal, E> {
+            Ok(Decimal::from(v))
+        }
+    }
+
+    deserializer.deserialize_any(DecimalVisitor)
+}
 
 /// Universal REST API response wrapper: `{"status":"OK","data":...}`
 #[derive(Debug, Clone, Deserialize)]
@@ -70,18 +107,31 @@ pub struct BalanceResponse {
 }
 
 /// Position from GET /api/v1/user/positions.
+/// API returns: id, accountId, market, status, side ("LONG"/"SHORT"),
+/// leverage (string), size, value, openPrice, markPrice, liquidationPrice,
+/// margin, unrealisedPnl, realisedPnl, adl, createdAt, updatedAt
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PositionResponse {
     pub market: String,
     pub side: Option<String>,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
     pub size: Decimal,
+    /// API field is "openPrice" not "entryPrice"
+    #[serde(alias = "openPrice", alias = "entryPrice")]
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
     pub entry_price: Decimal,
+    #[serde(alias = "markPrice")]
     pub mark_price: Option<Decimal>,
     pub liquidation_price: Option<Decimal>,
+    /// API uses British spelling "unrealisedPnl"
+    #[serde(alias = "unrealisedPnl", alias = "unrealizedPnl")]
     pub unrealized_pnl: Option<Decimal>,
+    #[serde(alias = "realisedPnl", alias = "realizedPnl")]
     pub realized_pnl: Option<Decimal>,
-    pub leverage: Option<u32>,
+    /// Leverage comes as a string from the API
+    #[serde(default)]
+    pub leverage: Option<String>,
 }
 
 /// Order from GET /api/v1/user/orders.
@@ -93,7 +143,9 @@ pub struct OrderResponse {
     pub market: String,
     pub side: String,
     pub r#type: String,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
     pub price: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
     pub qty: Decimal,
     pub filled_qty: Option<Decimal>,
     pub remaining_qty: Option<Decimal>,
@@ -131,8 +183,29 @@ pub struct TradeResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LeverageResponse {
-    pub market: String,
+    pub market: Option<String>,
+    #[serde(deserialize_with = "deserialize_u32_from_any")]
     pub leverage: u32,
+}
+
+fn deserialize_u32_from_any<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where D: serde::Deserializer<'de>,
+{
+    use serde::de;
+    struct U32Visitor;
+    impl<'de> de::Visitor<'de> for U32Visitor {
+        type Value = u32;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a u32 number or string")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<u32, E> {
+            v.parse::<u32>().map_err(de::Error::custom)
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u32, E> { Ok(v as u32) }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<u32, E> { Ok(v as u32) }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<u32, E> { Ok(v as u32) }
+    }
+    deserializer.deserialize_any(U32Visitor)
 }
 
 /// Market stats from GET /api/v1/info/markets/{market}/stats.

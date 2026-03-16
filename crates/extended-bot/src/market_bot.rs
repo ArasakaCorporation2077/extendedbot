@@ -30,6 +30,9 @@ pub struct MarketBot {
     vpin_calc: VpinCalculator,
     fast_cancel: FastCancel,
     last_requote: Instant,
+    last_binance_tick: Option<Instant>,
+    last_quoted_fp: Option<Decimal>,
+    consecutive_rejects: u32,
     order_seq: u64,
 }
 
@@ -89,6 +92,9 @@ impl MarketBot {
             vpin_calc,
             fast_cancel,
             last_requote: Instant::now(),
+            last_binance_tick: None,
+            last_quoted_fp: None,
+            consecutive_rejects: 0,
             order_seq: 0,
         }
     }
@@ -118,6 +124,14 @@ impl MarketBot {
                     *self.state.index_price.write() = Some(price);
                 }
             }
+            BotEvent::BinanceBbo { bid, ask, received_at } => {
+                self.last_binance_tick = Some(received_at);
+                let binance_mid = (bid + ask) / dec!(2);
+                *self.state.binance_mid.write() = Some(binance_mid);
+                self.fair_price_calc.update_reference_mid(binance_mid);
+                // Cancel is handled by on_orderbook_update when x10 tick arrives.
+                // No cancel here — avoids cancel storm from high-freq Binance ticks.
+            }
             BotEvent::FundingRate { .. } => {
                 // Informational only for now
             }
@@ -130,15 +144,42 @@ impl MarketBot {
                 self.on_order_update(resolved_ext_id, exchange_id, status, filled_qty, remaining_qty, avg_fill_price);
             }
             BotEvent::Fill {
-                external_id, exchange_id, price, qty, fee, is_maker, ..
+                external_id, exchange_id, price, qty, fee, is_maker, ts,
             } => {
                 let resolved_ext_id = self.resolve_external_id(&external_id, &exchange_id);
+
+                // Record fill delivery latency: exchange_fill_time → local_receive_time
+                if ts > 0 {
+                    let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+                    if now_ms > ts {
+                        let delivery_us = (now_ms - ts) * 1000; // ms → µs
+                        self.state.latency.record_fill_delivery(delivery_us);
+                        info!(
+                            fill_delivery_ms = (now_ms - ts),
+                            exchange_ts = ts,
+                            "Fill delivery latency"
+                        );
+                    }
+                }
+
+                // Record order-to-fill latency: local_send → fill WS receive
+                if let Some(order) = self.state.order_tracker.get_by_external_id(&resolved_ext_id) {
+                    let order_to_fill_us = order.timestamps.local_send.elapsed().as_micros() as u64;
+                    self.state.latency.record_order_to_fill(order_to_fill_us);
+                    info!(
+                        order_to_fill_ms = order_to_fill_us / 1000,
+                        external_id = %resolved_ext_id,
+                        "Order-to-fill latency"
+                    );
+                }
+
                 // Record fill for markout evaluation — skip if side unknown
                 if let Some(mid) = self.state.orderbook.mid() {
                     if let Some(order) = self.state.order_tracker.get_by_external_id(&resolved_ext_id) {
                         let is_buy = order.side == extended_types::order::Side::Buy;
+                        let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
                         self.state.markout.record_fill(
-                            self.state.market(), price, is_buy, mid,
+                            self.state.market(), price, is_buy, mid, bn_mid,
                         );
                     } else {
                         warn!(id = %resolved_ext_id, "Skipping markout: order not found in tracker");
@@ -183,22 +224,63 @@ impl MarketBot {
     }
 
     async fn on_orderbook_update(&mut self, bids: Vec<L2Level>, asks: Vec<L2Level>, is_snapshot: bool, _ts: u64) {
+        let tick_time = self.last_binance_tick
+            .filter(|t| t.elapsed() < Duration::from_millis(200))
+            .unwrap_or_else(Instant::now);
+
+        // === HOT PATH: orderbook → fair price → cancel. Minimum compute before cancel. ===
         if is_snapshot {
             self.state.orderbook.apply_snapshot(&bids, &asks, 0);
-            debug!(bids = bids.len(), asks = asks.len(), "Applied orderbook snapshot");
         } else {
             self.state.orderbook.apply_delta(&bids, &asks, 0);
         }
 
-        // Evaluate pending markouts against current mid
-        if let Some(mid) = self.state.orderbook.mid() {
-            let mids = std::collections::HashMap::from([
-                (self.state.market().to_string(), mid),
-            ]);
-            self.state.markout.evaluate(&mids);
+        let mid = match self.state.orderbook.mid() {
+            Some(m) => m,
+            None => return,
+        };
+
+        let fp = match self.fair_price_calc.update_local_mid(mid) {
+            Some(fp) => fp,
+            None => return,
+        };
+
+        let min_interval = Duration::from_millis(self.state.config.trading.min_requote_interval_ms);
+        let threshold = Decimal::try_from(self.state.config.trading.update_threshold_bps).unwrap_or(dec!(3.0));
+        let has_live_orders = self.state.order_tracker.live_count() > 0;
+
+        // Compare current fp vs last quoted fp — not fp vs mid (which always differs by basis)
+        let price_change = match self.last_quoted_fp {
+            Some(prev_fp) if !prev_fp.is_zero() => ((fp - prev_fp).abs() / prev_fp) * dec!(10000),
+            _ => dec!(9999), // No previous quote → force requote
+        };
+
+        // Backoff interval when orders keep failing (balance insufficient etc.)
+        let effective_interval = if self.consecutive_rejects >= 3 {
+            Duration::from_secs(10) // Back off to 10s after 3+ consecutive rejects
+        } else if !has_live_orders && self.last_quoted_fp.is_some() {
+            Duration::from_secs(1) // No live orders but we tried before: 1s
+        } else {
+            min_interval
+        };
+        let should_requote = self.last_requote.elapsed() >= effective_interval && (price_change >= threshold || !has_live_orders);
+
+        // Cancel IMMEDIATELY — before any non-critical computation
+        if should_requote && has_live_orders {
+            self.cancel_all_live(tick_time).await;
+        } else if has_live_orders {
+            self.check_fast_cancel(fp, tick_time).await;
         }
 
-        // Paper mode: check for simulated fills against market BBO (P0-5)
+        // === COLD PATH: non-latency-critical work after cancel is sent ===
+        if let Some(mid) = self.state.orderbook.mid() {
+            let market = self.state.market().to_string();
+            let mids = std::collections::HashMap::from([(market.clone(), mid)]);
+            let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
+            let bn_mids = std::collections::HashMap::from([(market, bn_mid)]);
+            self.state.markout.evaluate(&mids, &bn_mids);
+        }
+
         if let (Some(best_bid), Some(best_ask)) = (
             self.state.orderbook.best_bid().map(|l| l.price),
             self.state.orderbook.best_ask().map(|l| l.price),
@@ -206,38 +288,39 @@ impl MarketBot {
             self.state.adapter.check_fills(self.state.market(), best_bid, best_ask);
         }
 
-        // Notify book changed
         let seq = self.state.book_watch.borrow().wrapping_add(1);
         let _ = self.state.book_notify.send(seq);
 
-        // Calculate fair price
-        let mid = match self.state.orderbook.mid() {
-            Some(m) => m,
-            None => { debug!("No mid price, skipping strategy"); return; }
-        };
-
-        let fp = match self.fair_price_calc.update_local_mid(mid) {
-            Some(fp) => fp,
-            None => { debug!(mid = %mid, "EWMA warming up"); return; }
-        };
-
-        // Fast cancel check
-        self.check_fast_cancel(fp).await;
-
-        // Should we requote?
-        let min_interval = Duration::from_millis(self.state.config.trading.min_requote_interval_ms);
-        let price_change = self.fair_price_calc.price_change_bps(mid);
-        let threshold = Decimal::try_from(self.state.config.trading.update_threshold_bps).unwrap_or(dec!(3.0));
-        let has_live_orders = self.state.order_tracker.live_count() > 0;
-
-        // Requote if: price moved enough, OR we have no live orders (need initial quotes)
-        if self.last_requote.elapsed() >= min_interval && (price_change >= threshold || !has_live_orders) {
+        if should_requote {
             info!(fair_price = %fp, mid = %mid, change_bps = %price_change, has_orders = has_live_orders, "Requoting");
-            self.requote(fp).await;
+            self.requote(fp, tick_time).await;
         }
     }
 
-    async fn check_fast_cancel(&self, fair_price: Decimal) {
+    /// Cancel all live orders via mass cancel (single REST call).
+    async fn cancel_all_live(&self, tick_time: Instant) {
+        if self.state.smoke_mode { return; }
+        let market = self.state.market();
+        if self.state.order_tracker.live_count() == 0 { return; }
+
+        // Mark all as pending cancel
+        for order in &self.state.order_tracker.live_orders(market) {
+            self.state.order_tracker.mark_pending_cancel(&order.external_id);
+        }
+
+        let t0 = Instant::now();
+        match self.state.adapter.mass_cancel(market).await {
+            Ok(_) => {
+                self.state.latency.record_cancel_rtt(t0.elapsed().as_micros() as u64);
+                self.state.latency.record_tick_to_cancel(tick_time.elapsed().as_micros() as u64);
+            }
+            Err(e) => {
+                debug!(error = %e, "Mass cancel failed");
+            }
+        }
+    }
+
+    async fn check_fast_cancel(&self, fair_price: Decimal, tick_time: Instant) {
         if self.state.smoke_mode { return; }
 
         let best_bid = self.state.orderbook.best_bid().map(|l| l.price);
@@ -259,21 +342,29 @@ impl MarketBot {
                     "Fast cancel triggered"
                 );
                 self.state.order_tracker.mark_pending_cancel(&order.external_id);
+                let t0 = Instant::now();
                 if let Err(e) = self.state.adapter.cancel_order_by_external_id(&order.external_id).await {
                     warn!(error = %e, "Fast cancel failed");
+                } else {
+                    let cancel_rtt = t0.elapsed().as_micros() as u64;
+                    let tick_to_cancel = tick_time.elapsed().as_micros() as u64;
+                    self.state.latency.record_cancel_rtt(cancel_rtt);
+                    self.state.latency.record_tick_to_cancel(tick_to_cancel);
                 }
             }
         }
     }
 
-    async fn requote(&mut self, fair_price: Decimal) {
+    async fn requote(&mut self, fair_price: Decimal, tick_time: Instant) {
         if self.state.smoke_mode { return; }
         if !self.state.circuit_breaker.is_trading_allowed() {
             debug!("Circuit breaker active, skipping requote");
+
             return;
         }
 
         self.last_requote = Instant::now();
+        self.last_quoted_fp = Some(fair_price);
 
         let market = self.state.market().to_string();
         let inventory_ratio = self.state.position_manager.inventory_ratio(&market);
@@ -332,7 +423,7 @@ impl MarketBot {
 
         // Diff current orders vs desired quotes and send changes
         let t0 = Instant::now();
-        self.apply_quotes(&market, &quotes).await;
+        self.apply_quotes(&market, &quotes, tick_time).await;
         let cycle_us = t0.elapsed().as_micros();
         if cycle_us > 50_000 {
             warn!(cycle_us, bids = quotes.bids.len(), asks = quotes.asks.len(), "Requote cycle slow (>50ms)");
@@ -341,24 +432,9 @@ impl MarketBot {
         }
     }
 
-    async fn apply_quotes(&mut self, market: &str, quotes: &GeneratedQuotes) {
-        // 1. Fire all cancels in parallel
-        let live = self.state.order_tracker.live_orders(market);
-        if !live.is_empty() {
-            let cancel_futs: Vec<_> = live.iter().map(|order| {
-                self.state.order_tracker.mark_pending_cancel(&order.external_id);
-                let ext_id = order.external_id.clone();
-                let adapter = &self.state.adapter;
-                async move {
-                    if let Err(e) = adapter.cancel_order_by_external_id(&ext_id).await {
-                        debug!(error = %e, id = %ext_id, "Cancel failed (may already be filled)");
-                    }
-                }
-            }).collect();
-            futures_util::future::join_all(cancel_futs).await;
-        }
-
-        // 2. Build order requests synchronously (risk checks + signing prep)
+    async fn apply_quotes(&mut self, market: &str, quotes: &GeneratedQuotes, tick_time: Instant) {
+        // Cancels already fired in cancel_all_live() before quote pipeline.
+        // Build order requests synchronously (risk checks + signing prep)
         let mut order_reqs = Vec::new();
         for quote in quotes.bids.iter().map(|q| (Side::Buy, q)).chain(quotes.asks.iter().map(|q| (Side::Sell, q))) {
             if let Some(req) = self.prepare_order(market, quote.0, quote.1.price, quote.1.size, quotes.reduce_only) {
@@ -366,14 +442,19 @@ impl MarketBot {
             }
         }
 
-        // 3. Send all orders in parallel
+        // Send all orders in parallel
         if !order_reqs.is_empty() {
             let order_futs: Vec<_> = order_reqs.iter().map(|req| {
                 let state = &self.state;
                 let external_id = req.external_id.clone();
                 async move {
+                    let t0 = Instant::now();
                     match state.adapter.create_order(req).await {
                         Ok(ack) => {
+                            let rtt = t0.elapsed().as_micros() as u64;
+                            let ttt = tick_time.elapsed().as_micros() as u64;
+                            state.latency.record_order_rtt(rtt);
+                            state.latency.record_tick_to_trade(ttt);
                             state.order_tracker.on_rest_response(&external_id, ack.exchange_id);
                             if !ack.accepted {
                                 warn!(id = %external_id, msg = ?ack.message, "Order rejected by exchange");
@@ -381,20 +462,32 @@ impl MarketBot {
                                     &external_id, OrderStatus::Rejected,
                                     None, None, None, None,
                                 );
+                                return false;
                             }
+                            true
                         }
                         Err(e) => {
+                            let rtt = t0.elapsed().as_micros() as u64;
+                            state.latency.record_order_rtt(rtt);
+                            state.latency.record_tick_to_trade(tick_time.elapsed().as_micros() as u64);
                             error!(error = %e, id = %external_id, "Order creation failed");
                             state.circuit_breaker.record_error();
                             state.order_tracker.on_status_update(
                                 &external_id, OrderStatus::Rejected,
                                 None, None, None, None,
                             );
+                            false
                         }
                     }
                 }
             }).collect();
-            futures_util::future::join_all(order_futs).await;
+            let results = futures_util::future::join_all(order_futs).await;
+            let success = results.iter().filter(|&&ok| ok).count();
+            if success == 0 {
+                self.consecutive_rejects += 1;
+            } else {
+                self.consecutive_rejects = 0;
+            }
         }
     }
 
@@ -476,6 +569,34 @@ impl MarketBot {
         remaining_qty: Option<Decimal>,
         avg_fill_price: Option<Decimal>,
     ) {
+        // Record WS confirmation delay before updating status
+        if let Some(tracked) = self.state.order_tracker.get_by_external_id(&external_id) {
+            let elapsed_us = tracked.timestamps.local_send.elapsed().as_micros() as u64;
+            self.state.latency.record_ws_confirm(elapsed_us);
+
+            // x10 sends fills as ORDER events with status=FILLED/PARTIALLY_FILLED.
+            if status == OrderStatus::Filled || status == OrderStatus::PartiallyFilled {
+                self.state.latency.record_order_to_fill(elapsed_us);
+                info!(
+                    order_to_fill_ms = elapsed_us / 1000,
+                    external_id = %external_id,
+                    status = %status,
+                    "Order-to-fill latency (from ORDER FILLED event)"
+                );
+
+                // Record markout from ORDER FILLED event (x10 doesn't always send TRADE)
+                if let Some(fill_price) = avg_fill_price {
+                    if let Some(mid) = self.state.orderbook.mid() {
+                        let is_buy = tracked.side == extended_types::order::Side::Buy;
+                        let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
+                        self.state.markout.record_fill(
+                            self.state.market(), fill_price, is_buy, mid, bn_mid,
+                        );
+                    }
+                }
+            }
+        }
+
         self.state.order_tracker.on_status_update(
             &external_id,
             status,

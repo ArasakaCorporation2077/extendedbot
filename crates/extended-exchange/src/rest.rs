@@ -63,6 +63,22 @@ impl ExtendedRestClient {
         self.rate_limiter.clone()
     }
 
+    /// Warm up the HTTP connection pool by opening multiple concurrent connections.
+    /// This ensures parallel order submissions don't block on TLS handshakes.
+    pub async fn warmup_connections(&self, n: usize) {
+        let url = format!("{}/api/v1/info/markets", self.base_url);
+        let futs: Vec<_> = (0..n).map(|_| {
+            let client = self.client.clone();
+            let url = url.clone();
+            async move {
+                let _ = client.get(&url).send().await;
+            }
+        }).collect();
+        let t0 = std::time::Instant::now();
+        futures_util::future::join_all(futs).await;
+        info!(connections = n, warmup_ms = t0.elapsed().as_millis(), "HTTP connection pool warmed up");
+    }
+
     fn next_nonce(&self) -> u32 {
         self.nonce_counter.fetch_add(1, Ordering::SeqCst)
     }
@@ -183,7 +199,56 @@ impl ExtendedRestClient {
     }
 
     pub async fn get_leverage(&self, market: &str) -> Result<LeverageResponse> {
-        self.get_private(&format!("/api/v1/user/leverage?market={}", market)).await
+        self.rate_limit_wait().await;
+        let url = format!("{}/api/v1/user/leverage?market={}", self.base_url, market);
+        let mut req = self.client.get(&url);
+        for (k, v) in self.auth_headers() {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        info!(status = %status, raw = &text[..text.len().min(500)], "Leverage API response");
+        // Response is {"status":"OK","data":[{"market":"...","leverage":"N"}]}
+        if let Ok(wrapper) = serde_json::from_str::<crate::rest_types::ApiResponse<Vec<LeverageResponse>>>(&text) {
+            if let Some(entry) = wrapper.data.into_iter().find(|e| e.market.as_deref() == Some(market)) {
+                return Ok(entry);
+            }
+            anyhow::bail!("Leverage response missing market {}", market);
+        }
+        serde_json::from_str(&text).context(format!("Failed to parse leverage response: {}", &text[..text.len().min(200)]))
+    }
+
+    pub async fn set_leverage(&self, market: &str, leverage: u32) -> Result<LeverageResponse> {
+        self.rate_limit_wait().await;
+        let url = format!("{}/api/v1/user/leverage", self.base_url);
+        let body = serde_json::json!({
+            "market": market,
+            "leverage": leverage.to_string(),
+        });
+
+        let mut req = self.client.patch(&url).json(&body);
+        for (k, v) in self.auth_headers() {
+            req = req.header(k, v);
+        }
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        info!(status = %status, raw = &text[..text.len().min(500)], "Set leverage response");
+        if !status.is_success() {
+            anyhow::bail!("Set leverage failed: {} - {}", status, text);
+        }
+        // Response: {"status":"OK","data":{"market":"...","leverage":"N"}} or array
+        if let Ok(wrapper) = serde_json::from_str::<crate::rest_types::ApiResponse<LeverageResponse>>(&text) {
+            return Ok(wrapper.data);
+        }
+        if let Ok(wrapper) = serde_json::from_str::<crate::rest_types::ApiResponse<Vec<LeverageResponse>>>(&text) {
+            if let Some(entry) = wrapper.data.into_iter().next() {
+                return Ok(entry);
+            }
+        }
+        serde_json::from_str(&text).context(format!("Failed to parse set_leverage response: {}", &text[..text.len().min(200)]))
     }
 
     // === Private write endpoints (API key + Stark signature) ===

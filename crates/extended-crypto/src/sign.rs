@@ -37,28 +37,24 @@ pub struct DefaultStarkSigner {
 impl DefaultStarkSigner {
     /// Create from an Ethereum private key / seed string.
     /// Derives the Stark key via grind_key SHA-256 rejection sampling.
-    pub fn from_eth_key(eth_key: &str, vault_id: u64, testnet: bool) -> Result<Self> {
+    pub fn from_eth_key(eth_key: &str, vault_id: u64) -> Result<Self> {
         let private_key = grind_key(eth_key)?;
-        Self::from_private_key(private_key, vault_id, testnet)
+        Self::from_private_key(private_key, vault_id)
     }
 
     /// Create directly from a StarkNet private key hex string (e.g. from x10 API Details).
     /// Use this when the exchange gives you the Stark key directly.
-    pub fn from_stark_private_key(stark_private_hex: &str, vault_id: u64, testnet: bool) -> Result<Self> {
+    pub fn from_stark_private_key(stark_private_hex: &str, vault_id: u64) -> Result<Self> {
         let hex = stark_private_hex.strip_prefix("0x").unwrap_or(stark_private_hex);
         let private_key = Felt::from_hex(&format!("0x{}", hex))
             .map_err(|e| anyhow::anyhow!("Invalid Stark private key hex: {}", e))?;
-        Self::from_private_key(private_key, vault_id, testnet)
+        Self::from_private_key(private_key, vault_id)
     }
 
-    fn from_private_key(private_key: Felt, vault_id: u64, testnet: bool) -> Result<Self> {
+    fn from_private_key(private_key: Felt, vault_id: u64) -> Result<Self> {
         let public_key = public_key_from_private(&private_key);
         let public_key_hex = format!("0x{:064x}", public_key);
-        let domain = if testnet {
-            StarkDomain::sepolia()
-        } else {
-            StarkDomain::mainnet()
-        };
+        let domain = StarkDomain::mainnet();
 
         Ok(Self {
             private_key,
@@ -140,13 +136,9 @@ pub struct DummySigner {
 }
 
 impl DummySigner {
-    pub fn new(testnet: bool) -> Self {
+    pub fn new() -> Self {
         Self {
-            domain: if testnet {
-                StarkDomain::sepolia()
-            } else {
-                StarkDomain::mainnet()
-            },
+            domain: StarkDomain::mainnet(),
         }
     }
 }
@@ -182,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_dummy_signer() {
-        let signer = DummySigner::new(true);
+        let signer = DummySigner::new();
         let params = OrderSignParams {
             position_id: 1,
             side: extended_types::order::Side::Buy,
@@ -203,14 +195,14 @@ mod tests {
 
     #[test]
     fn test_key_derivation_and_sign() {
-        let signer = DefaultStarkSigner::from_eth_key("test_seed_for_signing", 10001, true).unwrap();
+        let signer = DefaultStarkSigner::from_eth_key("test_seed_for_signing", 10001).unwrap();
         assert!(!signer.public_key_hex().is_empty());
         assert_ne!(*signer.public_key_felt(), Felt::ZERO);
     }
 
     #[test]
     fn test_set_vault_id() {
-        let signer = DefaultStarkSigner::from_eth_key("test_seed", 0, true).unwrap();
+        let signer = DefaultStarkSigner::from_eth_key("test_seed", 0).unwrap();
         assert_eq!(signer.vault_id(), 0);
         signer.set_vault_id(12345);
         assert_eq!(signer.vault_id(), 12345);
@@ -220,7 +212,7 @@ mod tests {
     fn test_sign_deterministic() {
         // Verify that signing the same message with the same key produces the same signature
         // (ecdsa_sign uses deterministic k)
-        let signer = DefaultStarkSigner::from_eth_key("test_seed_for_determinism", 10001, true).unwrap();
+        let signer = DefaultStarkSigner::from_eth_key("test_seed_for_determinism", 10001).unwrap();
         let params = OrderSignParams {
             position_id: 1,
             side: extended_types::order::Side::Buy,

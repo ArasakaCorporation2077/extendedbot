@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use rust_decimal::Decimal;
 use crate::market_data::{L2Level, TradeData};
 use crate::order::OrderStatus;
@@ -62,6 +64,13 @@ pub enum BotEvent {
         available: Decimal,
         total_equity: Decimal,
         ts: u64,
+    },
+
+    // -- External reference data --
+    BinanceBbo {
+        bid: Decimal,
+        ask: Decimal,
+        received_at: Instant,
     },
 
     // -- Internal signals --

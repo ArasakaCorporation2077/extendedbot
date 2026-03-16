@@ -35,7 +35,7 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
             let signer: Arc<dyn extended_crypto::StarkSigner> =
                 if config.exchange.api_secret.is_empty() {
                     warn!("No API secret, using dummy signer (read-only)");
-                    Arc::new(DummySigner::new(config.exchange.testnet))
+                    Arc::new(DummySigner::new())
                 } else {
                     // If secret starts with 0x and looks like a hex key, use it directly
                     // as a Stark private key. Otherwise derive via grind_key.
@@ -44,13 +44,11 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
                             DefaultStarkSigner::from_stark_private_key(
                                 &config.exchange.api_secret,
                                 0, // vault_id populated from account info below
-                                config.exchange.testnet,
                             )?
                         } else {
                             DefaultStarkSigner::from_eth_key(
                                 &config.exchange.api_secret,
                                 0,
-                                config.exchange.testnet,
                             )?
                         }
                     );
@@ -87,13 +85,55 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
                         }
                     }
 
+                    // Warm up signing: first call initializes Poseidon tables + EC params (~100ms),
+                    // subsequent calls take ~2ms. Do this once at startup, not on the hot path.
+                    {
+                        use extended_crypto::hash::OrderSignParams;
+                        let warmup_params = OrderSignParams {
+                            position_id: 0,
+                            side: extended_types::order::Side::Buy,
+                            base_asset_id: "0x1".to_string(),
+                            quote_asset_id: "0x1".to_string(),
+                            base_qty: rust_decimal_macros::dec!(1),
+                            quote_qty: rust_decimal_macros::dec!(1),
+                            fee_absolute: rust_decimal_macros::dec!(0.01),
+                            expiration_epoch_millis: 1000000000000,
+                            nonce: 1,
+                            collateral_resolution: 1_000_000,
+                            synthetic_resolution: 1_000_000,
+                        };
+                        let t0 = std::time::Instant::now();
+                        let _ = extended_crypto::StarkSigner::sign_order(concrete.as_ref(), &warmup_params);
+                        info!(warmup_us = t0.elapsed().as_micros(), "Signing warmup complete");
+                    }
+
                     concrete as Arc<dyn extended_crypto::StarkSigner>
                 };
 
             let rest = ExtendedRestClient::new(&config.exchange, signer);
 
+            // Warm up HTTP connection pool: open 4 concurrent connections
+            // so parallel order submissions don't block on TLS handshakes
+            rest.warmup_connections(4).await;
+
             // Bootstrap market metadata (P0-1: required for order signing & tick sizes)
             let (tick, step) = bootstrap_market_config(&rest, &config.trading.market).await;
+
+            // Set leverage on exchange to match config
+            let target_leverage = config.trading.leverage;
+            match rest.get_leverage(&config.trading.market).await {
+                Ok(current) => {
+                    if current.leverage != target_leverage {
+                        match rest.set_leverage(&config.trading.market, target_leverage).await {
+                            Ok(resp) => info!(from = current.leverage, to = resp.leverage, "Leverage updated"),
+                            Err(e) => warn!(error = %e, "Failed to set leverage"),
+                        }
+                    } else {
+                        info!(leverage = target_leverage, "Leverage already set");
+                    }
+                }
+                Err(e) => warn!(error = %e, "Failed to get leverage"),
+            }
 
             (Box::new(rest), tick, step)
         };
@@ -120,6 +160,18 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
 
     // 5. Spawn WS connections (always — paper mode needs live market data for check_fills)
     let ws_handles = spawn_ws_connections(&config, state.event_tx.clone()).await;
+
+    // 5b. Spawn Binance reference price feed
+    {
+        let binance_ws = extended_exchange::BinanceWs::from_market(state.market());
+        let tx = state.event_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = binance_ws.run(tx).await {
+                error!(error = %e, "Binance WS exited");
+            }
+        });
+        info!("Binance bookTicker feed spawned");
+    }
 
     // 6. Activate dead man's switch (live only, not smoke)
     if !config.exchange.paper_trading && !smoke_mode {
@@ -156,20 +208,17 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
 
     loop {
         tokio::select! {
-            biased;
+            // No `biased` — fair scheduling prevents event_rx from starving timers
 
             _ = shutdown_rx.recv() => {
                 info!("Shutdown signal received");
                 break;
             }
 
-            Some(event) = event_rx.recv() => {
-                bot.handle_event(event).await;
-            }
-
             _ = cleanup_interval.tick() => {
                 bot.cleanup().await;
                 state.markout.log_summary(state.market());
+                state.latency.log_summary();
             }
 
             _ = reconcile_interval.tick() => {
@@ -178,12 +227,17 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
                 }
             }
 
+            Some(event) = event_rx.recv() => {
+                bot.handle_event(event).await;
+            }
+
             _ = markout_tick.tick() => {
                 if let Some(mid) = state.orderbook.mid() {
-                    let mids = std::collections::HashMap::from([
-                        (state.market().to_string(), mid),
-                    ]);
-                    state.markout.evaluate(&mids);
+                    let market = state.market().to_string();
+                    let mids = std::collections::HashMap::from([(market.clone(), mid)]);
+                    let bn_mid = state.binance_mid.read().unwrap_or(Decimal::ZERO);
+                    let bn_mids = std::collections::HashMap::from([(market, bn_mid)]);
+                    state.markout.evaluate(&mids, &bn_mids);
                 }
             }
 
@@ -399,4 +453,137 @@ async fn spawn_ws_connections(
     }
 
     handles
+}
+
+/// Close all open positions: mass cancel → fetch positions → submit reduce-only orders.
+pub async fn close_all(config: AppConfig) -> Result<()> {
+    // 1. Create signer + REST client
+    let signer: Arc<dyn extended_crypto::StarkSigner> = {
+        let concrete = Arc::new(
+            if config.exchange.api_secret.starts_with("0x") {
+                DefaultStarkSigner::from_stark_private_key(
+                    &config.exchange.api_secret, 0,
+                )?
+            } else {
+                DefaultStarkSigner::from_eth_key(
+                    &config.exchange.api_secret, 0,
+                )?
+            }
+        );
+
+        let temp_rest = ExtendedRestClient::new(&config.exchange, concrete.clone());
+        if let Ok(account_info) = temp_rest.get_account_info().await {
+            if let Some(vault_id) = account_info.vault_id() {
+                concrete.set_vault_id(vault_id);
+                info!(vault_id, "Vault ID loaded");
+            }
+        }
+
+        concrete as Arc<dyn extended_crypto::StarkSigner>
+    };
+
+    let rest = ExtendedRestClient::new(&config.exchange, signer);
+
+    // 2. Cache market config for signing
+    let market = &config.trading.market;
+    bootstrap_market_config(&rest, market).await;
+
+    // 3. Mass cancel all open orders
+    info!("Mass cancelling all orders...");
+    match rest.mass_cancel(market).await {
+        Ok(_) => info!("Mass cancel sent"),
+        Err(e) => warn!(error = %e, "Mass cancel failed"),
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // 4. Fetch positions via REST (raw JSON since parsing may fail)
+    info!("Fetching positions...");
+    let positions = rest.get_positions().await;
+    match positions {
+        Ok(positions) => {
+            for pos in &positions {
+                if pos.size == Decimal::ZERO {
+                    continue;
+                }
+                let signed_size = match pos.side.as_deref() {
+                    Some("short") | Some("SHORT") | Some("SELL") => -pos.size.abs(),
+                    _ => pos.size.abs(),
+                };
+
+                // To close: sell if long, buy if short
+                let (close_side, close_side_str) = if signed_size > Decimal::ZERO {
+                    (extended_types::order::Side::Sell, "SELL")
+                } else {
+                    (extended_types::order::Side::Buy, "BUY")
+                };
+
+                let close_qty = signed_size.abs();
+                // Aggressive price: 0.5% worse than mark to guarantee fill.
+                let raw_price = pos.mark_price.unwrap_or(pos.entry_price);
+                let slippage = raw_price * dec!(0.005);
+                let close_price = if signed_size > Decimal::ZERO {
+                    // Long → sell: mark - 0.5%
+                    (raw_price - slippage).round_dp(0)
+                } else {
+                    // Short → buy: mark + 0.5%
+                    (raw_price + slippage).round_dp(0)
+                };
+
+                info!(
+                    market = %pos.market,
+                    side = close_side_str,
+                    qty = %close_qty,
+                    price = %close_price,
+                    "Closing position"
+                );
+
+                let req = extended_types::order::OrderRequest {
+                    external_id: format!("close-{}", uuid::Uuid::new_v4().simple()),
+                    market: pos.market.clone(),
+                    side: close_side,
+                    price: close_price,
+                    qty: close_qty,
+                    order_type: extended_types::order::OrderType::Limit,
+                    post_only: false,
+                    reduce_only: true,
+                    time_in_force: extended_types::order::TimeInForce::Gtt,
+                    max_fee: dec!(0.0003),
+                    expiry_epoch_millis: chrono::Utc::now().timestamp_millis() as u64
+                        + 7 * 24 * 3600 * 1000,
+                    cancel_id: None,
+                };
+
+                match rest.create_order(&req).await {
+                    Ok(ack) => info!(accepted = ack.accepted, msg = ?ack.message, "Close order submitted"),
+                    Err(e) => {
+                        error!(error = %e, "Close order failed");
+                        continue;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to fetch positions — try closing manually on the exchange UI");
+            return Ok(());
+        }
+    }
+
+    // 5. Poll until positions are flat (max 30s)
+    for i in 0..15 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        match rest.get_positions().await {
+            Ok(positions) => {
+                let open: Vec<_> = positions.iter().filter(|p| p.size != Decimal::ZERO).collect();
+                if open.is_empty() {
+                    info!("All positions closed");
+                    return Ok(());
+                }
+                info!(attempt = i + 1, remaining = open.len(), "Waiting for positions to close...");
+            }
+            Err(e) => warn!(error = %e, "Position poll failed"),
+        }
+    }
+    warn!("Timeout waiting for positions to close — check exchange UI");
+
+    Ok(())
 }

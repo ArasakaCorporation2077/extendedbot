@@ -11,6 +11,7 @@ use extended_exchange::order_tracker::OrderTracker;
 use extended_orderbook::LocalOrderbook;
 use extended_risk::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use extended_risk::exposure::ExposureTracker;
+use extended_risk::latency::LatencyTracker;
 use extended_risk::markout::MarkoutTracker;
 use extended_risk::position_manager::PositionManager;
 use extended_types::config::AppConfig;
@@ -27,12 +28,14 @@ pub struct BotState {
     pub exposure_tracker: ExposureTracker,
     pub circuit_breaker: CircuitBreaker,
     pub markout: MarkoutTracker,
+    pub latency: LatencyTracker,
     pub event_tx: mpsc::UnboundedSender<BotEvent>,
     pub event_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<BotEvent>>>,
     pub book_notify: watch::Sender<u64>,
     pub book_watch: watch::Receiver<u64>,
     pub mark_price: RwLock<Option<Decimal>>,
     pub index_price: RwLock<Option<Decimal>>,
+    pub binance_mid: RwLock<Option<Decimal>>,
     pub smoke_mode: bool,
     /// Market tick size from exchange metadata.
     pub tick_size: RwLock<Decimal>,
@@ -63,12 +66,14 @@ impl BotState {
             exposure_tracker: ExposureTracker::new(config.risk.max_position_usd),
             circuit_breaker: CircuitBreaker::new(cb_config),
             markout: MarkoutTracker::new(500, 0.2),
+            latency: LatencyTracker::new(),
             event_tx,
             event_rx: parking_lot::Mutex::new(Some(event_rx)),
             book_notify,
             book_watch,
             mark_price: RwLock::new(None),
             index_price: RwLock::new(None),
+            binance_mid: RwLock::new(None),
             tick_size: RwLock::new(rust_decimal_macros::dec!(0.1)),
             size_step: RwLock::new(rust_decimal_macros::dec!(0.001)),
             adapter,

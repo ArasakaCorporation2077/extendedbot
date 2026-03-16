@@ -18,8 +18,6 @@ pub struct ExchangeConfig {
     #[serde(default)]
     pub api_secret: String,
     #[serde(default)]
-    pub testnet: bool,
-    #[serde(default)]
     pub paper_trading: bool,
     #[serde(default = "default_user_agent")]
     pub user_agent: String,
@@ -31,19 +29,11 @@ fn default_user_agent() -> String {
 
 impl ExchangeConfig {
     pub fn rest_base_url(&self) -> &str {
-        if self.testnet {
-            "https://api.starknet.sepolia.extended.exchange"
-        } else {
-            "https://api.starknet.extended.exchange"
-        }
+        "https://api.starknet.extended.exchange"
     }
 
     pub fn ws_url(&self) -> &str {
-        if self.testnet {
-            "wss://starknet.sepolia.extended.exchange"
-        } else {
-            "wss://app.extended.exchange"
-        }
+        "wss://app.extended.exchange"
     }
 }
 

@@ -174,6 +174,10 @@ impl ExtendedWebSocket {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
+                            // Log raw private WS messages for debugging
+                            if self.needs_auth() {
+                                debug!(stream = ?self.stream, raw = &text[..text.len().min(500)], "Private WS raw message");
+                            }
                             // Skip JSON-RPC ping responses
                             if text.contains("\"method\":\"ping\"") && text.contains("\"result\"") {
                                 continue;
