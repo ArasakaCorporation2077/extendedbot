@@ -186,16 +186,15 @@ mod tests {
         let params = OrderSignParams {
             position_id: 1,
             side: extended_types::order::Side::Buy,
-            base_asset: "BTC".to_string(),
-            quote_asset: "USD".to_string(),
+            base_asset_id: "0x4254432d3600000000000000000000".to_string(),
+            quote_asset_id: "0x1".to_string(),
             base_qty: rust_decimal_macros::dec!(0.001),
             quote_qty: rust_decimal_macros::dec!(43.445),
-            fee: rust_decimal_macros::dec!(0.02),
+            fee_absolute: rust_decimal_macros::dec!(0.02),
             expiration_epoch_millis: 1704416937000,
             nonce: 1,
-            salt: 12345,
             collateral_resolution: 1_000_000,
-            synthetic_resolution: 1_000_000_000,
+            synthetic_resolution: 1_000_000,
         };
         let sig = signer.sign_order(&params).unwrap();
         assert_eq!(sig.r, "0x0");
