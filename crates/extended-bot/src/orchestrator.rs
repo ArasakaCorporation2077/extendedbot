@@ -208,21 +208,20 @@ async fn bootstrap_market_config(rest: &ExtendedRestClient, market: &str) -> (De
     match rest.get_markets().await {
         Ok(markets) => {
             if let Some(m) = markets.iter().find(|m| m.market() == market) {
-                // Starknet version: derive resolution from asset precision fields.
-                // collateralAssetPrecision=6 → 10^6 = 1_000_000
-                // assetPrecision=5 → 10^5 = 100_000
-                let collateral_res = m.collateral_asset_precision
-                    .map(|p| 10u64.pow(p))
-                    .unwrap_or(1_000_000);
-                let synthetic_res = m.asset_precision
-                    .map(|p| 10u64.pow(p))
-                    .unwrap_or(100_000);
-                rest.cache_market_config(collateral_res, synthetic_res);
+                // Use l2Config from exchange (authoritative for signing)
+                let l2 = m.l2_config.as_ref().or(m.settlement_config.as_ref());
+                let collateral_res = l2.and_then(|c| c.collateral_resolution).unwrap_or(1_000_000);
+                let synthetic_res = l2.and_then(|c| c.synthetic_resolution).unwrap_or(1_000_000);
+                let collateral_id = l2.and_then(|c| c.collateral_id.clone()).unwrap_or("0x1".to_string());
+                let synthetic_id = l2.and_then(|c| c.synthetic_id.clone()).unwrap_or_default();
+                rest.cache_market_config(collateral_res, synthetic_res, collateral_id.clone(), synthetic_id.clone());
                 info!(
                     market = %market,
                     collateral_resolution = collateral_res,
                     synthetic_resolution = synthetic_res,
-                    "Market config cached for signing"
+                    collateral_id = %collateral_id,
+                    synthetic_id = %synthetic_id,
+                    "Market L2 config cached for signing"
                 );
 
                 if let Some(tc) = &m.trading_config {

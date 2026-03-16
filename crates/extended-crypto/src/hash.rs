@@ -1,4 +1,7 @@
 //! Order hash computation using Poseidon for Extended Exchange SNIP12 signing.
+//!
+//! Asset IDs come from l2Config (e.g. syntheticId="0x4254432d36...", collateralId="0x1").
+//! Amounts are signed: negative for what you give, positive for what you receive.
 
 use anyhow::Result;
 use starknet_crypto::{Felt, PoseidonHasher};
@@ -48,35 +51,49 @@ impl StarkDomain {
 pub struct OrderSignParams {
     pub position_id: u64,
     pub side: Side,
-    pub base_asset: String,
-    pub quote_asset: String,
+    /// Hex asset ID from l2Config.syntheticId (e.g. "0x4254432d3600000000000000000000")
+    pub base_asset_id: String,
+    /// Hex asset ID from l2Config.collateralId (e.g. "0x1")
+    pub quote_asset_id: String,
     pub base_qty: Decimal,
+    /// Absolute collateral amount = price * qty
     pub quote_qty: Decimal,
-    pub fee: Decimal,
+    /// Absolute fee amount = fee_rate * price * qty
+    pub fee_absolute: Decimal,
     pub expiration_epoch_millis: u64,
+    /// Nonce — also used as salt in the hash
     pub nonce: u32,
-    pub salt: u64,
     pub collateral_resolution: u64,
     pub synthetic_resolution: u64,
 }
 
 /// Compute the order hash for Extended Exchange signing.
-///
-/// The hash includes all order parameters with domain separation
-/// to prevent cross-chain replay attacks.
 pub fn compute_order_hash(
     params: &OrderSignParams,
     domain: &StarkDomain,
     public_key: &Felt,
 ) -> Result<Felt> {
     // Scale amounts by resolution
-    let scaled_collateral = scale_amount(params.quote_qty, params.collateral_resolution, params.side == Side::Buy);
-    let scaled_synthetic = scale_amount(params.base_qty, params.synthetic_resolution, params.side == Side::Sell);
-    let scaled_fee = scale_amount(params.fee, params.collateral_resolution, true);
+    let base_amount = scale_amount(params.base_qty, params.synthetic_resolution);
+    let quote_amount = scale_amount(params.quote_qty, params.collateral_resolution);
+    let fee_amount = scale_amount(params.fee_absolute, params.collateral_resolution);
 
-    // Use the expiration as-is. Callers are responsible for setting a valid
-    // expiry within exchange limits (mainnet: up to 90 days, testnet: up to 28 days).
+    // Apply sign convention:
+    // BUY: receive base (positive), pay quote (negative)
+    // SELL: give base (negative), receive quote (positive)
+    let (signed_base, signed_quote) = match params.side {
+        Side::Buy => (base_amount as i128, -(quote_amount as i128)),
+        Side::Sell => (-(base_amount as i128), quote_amount as i128),
+    };
+
     let expiry_seconds = params.expiration_epoch_millis / 1000;
+
+    // Parse hex asset IDs from l2Config
+    let base_asset_felt = Felt::from_hex(&params.base_asset_id)
+        .map_err(|e| anyhow::anyhow!("Invalid base_asset_id hex: {}", e))?;
+    let quote_asset_felt = Felt::from_hex(&params.quote_asset_id)
+        .map_err(|e| anyhow::anyhow!("Invalid quote_asset_id hex: {}", e))?;
+    let fee_asset_felt = quote_asset_felt; // fee in collateral
 
     // Build the order message hash
     let order_type_hash = compute_order_type_hash();
@@ -84,14 +101,14 @@ pub fn compute_order_hash(
     let mut hasher = PoseidonHasher::new();
     hasher.update(order_type_hash);
     hasher.update(Felt::from(params.position_id));
-    hasher.update(felt_from_str(&params.base_asset));
-    hasher.update(felt_from_str(&params.quote_asset));
-    hasher.update(Felt::from(scaled_collateral));
-    hasher.update(Felt::from(scaled_synthetic));
-    hasher.update(Felt::from(scaled_fee));
+    hasher.update(base_asset_felt);
+    hasher.update(quote_asset_felt);
+    hasher.update(fee_asset_felt);
+    hasher.update(i128_to_felt(signed_base));
+    hasher.update(i128_to_felt(signed_quote));
+    hasher.update(Felt::from(fee_amount));
     hasher.update(Felt::from(expiry_seconds));
-    hasher.update(Felt::from(params.nonce as u64));
-    hasher.update(Felt::from(params.salt));
+    hasher.update(Felt::from(params.nonce as u64)); // nonce used as salt
     let message_hash = hasher.finalize();
 
     // SNIP12: H("StarkNet Message", domain_hash, public_key, message_hash)
@@ -113,12 +130,24 @@ fn compute_order_type_hash() -> Felt {
     hasher.finalize()
 }
 
-/// Scale a decimal amount by resolution, rounding up or down.
-/// Panics if the scaled value overflows u64 — this is intentional to prevent
-/// silently signing orders with zero amounts.
-fn scale_amount(amount: Decimal, resolution: u64, round_up: bool) -> u64 {
+/// Convert a signed i128 to Felt.
+/// Negative values use the StarkNet field modulus: PRIME + value.
+fn i128_to_felt(value: i128) -> Felt {
+    if value >= 0 {
+        Felt::from(value as u128)
+    } else {
+        let abs = (-value) as u128;
+        let prime = Felt::from_hex(
+            "0x800000000000011000000000000000000000000000000000000000000000001"
+        ).expect("Invalid prime");
+        prime - Felt::from(abs)
+    }
+}
+
+/// Scale a decimal amount by resolution, rounding up (ceiling).
+fn scale_amount(amount: Decimal, resolution: u64) -> u64 {
     let scaled = amount * Decimal::from(resolution);
-    let rounded = if round_up { scaled.ceil() } else { scaled.floor() };
+    let rounded = scaled.ceil();
     rounded.to_string().parse::<u64>()
         .unwrap_or_else(|_| panic!(
             "scale_amount overflow: {} * {} = {} does not fit u64",
@@ -127,17 +156,12 @@ fn scale_amount(amount: Decimal, resolution: u64, round_up: bool) -> u64 {
 }
 
 /// Convert a short string (up to 31 bytes) to a Felt.
-fn short_string_to_felt(s: &str) -> Felt {
+pub fn short_string_to_felt(s: &str) -> Felt {
     let bytes = s.as_bytes();
     assert!(bytes.len() <= 31, "Short string too long: {}", s);
     let mut arr = [0u8; 32];
     arr[32 - bytes.len()..].copy_from_slice(bytes);
     Felt::from_bytes_be(&arr)
-}
-
-/// Convert an arbitrary string to a Felt by hashing it.
-fn felt_from_str(s: &str) -> Felt {
-    short_string_to_felt(s)
 }
 
 #[cfg(test)]
@@ -159,17 +183,21 @@ mod tests {
     }
 
     #[test]
-    fn test_scale_amount_buy_ceiling() {
-        // Buy: ceiling rounding
-        let result = scale_amount(Decimal::new(1001, 3), 1_000_000, true); // 1.001 * 1M
+    fn test_scale_amount() {
+        let result = scale_amount(Decimal::new(1001, 3), 1_000_000);
         assert_eq!(result, 1_001_000);
     }
 
     #[test]
-    fn test_scale_amount_sell_floor() {
-        // Sell: floor rounding
-        let result = scale_amount(Decimal::new(1001, 3), 1_000_000, false);
-        assert_eq!(result, 1_001_000);
+    fn test_i128_to_felt_positive() {
+        let f = i128_to_felt(1390);
+        assert_eq!(f, Felt::from(1390u64));
+    }
+
+    #[test]
+    fn test_i128_to_felt_negative() {
+        let f = i128_to_felt(-1390);
+        assert_ne!(f, Felt::ZERO);
     }
 
     #[test]

@@ -32,6 +32,10 @@ pub struct ExtendedRestClient {
 struct MarketConfigCache {
     collateral_resolution: u64,
     synthetic_resolution: u64,
+    /// On-chain collateral asset ID (e.g., "0x1" for USD)
+    collateral_id: String,
+    /// On-chain synthetic asset ID (e.g., "0x4254432d36..." for BTC-USD)
+    synthetic_id: String,
 }
 
 impl ExtendedRestClient {
@@ -184,10 +188,18 @@ impl ExtendedRestClient {
 
     // === Private write endpoints (API key + Stark signature) ===
 
-    pub fn cache_market_config(&self, collateral_resolution: u64, synthetic_resolution: u64) {
+    pub fn cache_market_config(
+        &self,
+        collateral_resolution: u64,
+        synthetic_resolution: u64,
+        collateral_id: String,
+        synthetic_id: String,
+    ) {
         *self.market_config.write() = Some(MarketConfigCache {
             collateral_resolution,
             synthetic_resolution,
+            collateral_id,
+            synthetic_id,
         });
     }
 
@@ -199,19 +211,20 @@ impl ExtendedRestClient {
     fn build_order_sign_params(&self, req: &OrderRequest) -> Result<OrderSignParams> {
         let mc = self.get_market_config()?;
         let nonce = self.next_nonce();
-        let salt = chrono::Utc::now().timestamp_millis() as u64;
+
+        let quote_qty = req.price * req.qty;
+        let fee_absolute = req.max_fee * quote_qty; // fee = rate * notional
 
         Ok(OrderSignParams {
             position_id: self.signer.vault_id(),
             side: req.side,
-            base_asset: req.market.clone(),
-            quote_asset: "USD".to_string(),
+            base_asset_id: mc.synthetic_id.clone(),
+            quote_asset_id: mc.collateral_id.clone(),
             base_qty: req.qty,
-            quote_qty: req.price * req.qty,
-            fee: req.max_fee,
+            quote_qty,
+            fee_absolute,
             expiration_epoch_millis: req.expiry_epoch_millis,
             nonce,
-            salt,
             collateral_resolution: mc.collateral_resolution,
             synthetic_resolution: mc.synthetic_resolution,
         })

@@ -22,6 +22,8 @@ pub struct MarketResponse {
     pub collateral_asset_precision: Option<u32>,
     pub trading_config: Option<TradingConfigResponse>,
     pub settlement_config: Option<L2ConfigResponse>,
+    #[serde(alias = "l2Config")]
+    pub l2_config: Option<L2ConfigResponse>,
 }
 
 impl MarketResponse {
@@ -47,6 +49,7 @@ pub struct L2ConfigResponse {
     pub collateral_resolution: Option<u64>,
     pub synthetic_id: Option<String>,
     pub synthetic_resolution: Option<u64>,
+    pub r#type: Option<String>,
 }
 
 /// Balance from GET /api/v1/user/balance.
