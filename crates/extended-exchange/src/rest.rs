@@ -231,10 +231,12 @@ impl ExtendedRestClient {
     }
 
     async fn submit_order(&self, req: &OrderRequest) -> Result<CreateOrderResponse> {
+        let t0 = std::time::Instant::now();
         self.rate_limit_wait().await;
 
         let sign_params = self.build_order_sign_params(req)?;
         let signature = self.signer.sign_order(&sign_params)?;
+        let sign_us = t0.elapsed().as_micros();
 
         let side_str = match req.side {
             extended_types::order::Side::Buy => "BUY",
@@ -271,9 +273,16 @@ impl ExtendedRestClient {
             http_req = http_req.header(k, v);
         }
 
-        info!(order = %serde_json::to_string(&body).unwrap_or_default(), "Submitting order");
+        let t_send = std::time::Instant::now();
         let resp = http_req.json(&body).send().await
             .context("POST /user/order failed")?;
+        let rtt_us = t_send.elapsed().as_micros();
+        info!(
+            sign_us = sign_us,
+            rtt_us = rtt_us,
+            total_us = t0.elapsed().as_micros(),
+            "Order submitted"
+        );
 
         if resp.status() == 429 {
             self.rate_limiter.on_rate_limited();

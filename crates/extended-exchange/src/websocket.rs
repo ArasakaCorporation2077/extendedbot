@@ -225,6 +225,7 @@ impl ExtendedWebSocket {
     }
 
     fn handle_message(&self, text: &str, event_tx: &mpsc::UnboundedSender<BotEvent>) {
+        let recv_us = std::time::Instant::now();
         // Parse the envelope
         let envelope: WsEnvelope = match serde_json::from_str(text) {
             Ok(env) => env,
@@ -254,6 +255,11 @@ impl ExtendedWebSocket {
             WsStream::Trades(_) => self.handle_trades(envelope.data, ts, event_tx),
             WsStream::MarkPrice(_) => self.handle_mark_price(envelope.data, event_tx),
             WsStream::Private => self.handle_private(envelope.msg_type.as_deref(), envelope.data, ts, event_tx),
+        }
+
+        let process_us = recv_us.elapsed().as_micros();
+        if process_us > 1000 {
+            warn!(stream = ?self.stream, process_us, "WS message processing slow (>1ms)");
         }
     }
 

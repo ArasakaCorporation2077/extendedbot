@@ -331,31 +331,76 @@ impl MarketBot {
         let quotes = self.quote_gen.generate(&input);
 
         // Diff current orders vs desired quotes and send changes
+        let t0 = Instant::now();
         self.apply_quotes(&market, &quotes).await;
+        let cycle_us = t0.elapsed().as_micros();
+        if cycle_us > 50_000 {
+            warn!(cycle_us, bids = quotes.bids.len(), asks = quotes.asks.len(), "Requote cycle slow (>50ms)");
+        } else {
+            debug!(cycle_us, "Requote cycle");
+        }
     }
 
     async fn apply_quotes(&mut self, market: &str, quotes: &GeneratedQuotes) {
-        // Cancel all existing orders and replace with new ones.
-        // Future optimization: diff and use cancelId for atomic replace.
+        // 1. Fire all cancels in parallel
         let live = self.state.order_tracker.live_orders(market);
+        if !live.is_empty() {
+            let cancel_futs: Vec<_> = live.iter().map(|order| {
+                self.state.order_tracker.mark_pending_cancel(&order.external_id);
+                let ext_id = order.external_id.clone();
+                let adapter = &self.state.adapter;
+                async move {
+                    if let Err(e) = adapter.cancel_order_by_external_id(&ext_id).await {
+                        debug!(error = %e, id = %ext_id, "Cancel failed (may already be filled)");
+                    }
+                }
+            }).collect();
+            futures_util::future::join_all(cancel_futs).await;
+        }
 
-        for order in &live {
-            self.state.order_tracker.mark_pending_cancel(&order.external_id);
-            if let Err(e) = self.state.adapter.cancel_order_by_external_id(&order.external_id).await {
-                debug!(error = %e, id = %order.external_id, "Cancel failed (may already be filled)");
+        // 2. Build order requests synchronously (risk checks + signing prep)
+        let mut order_reqs = Vec::new();
+        for quote in quotes.bids.iter().map(|q| (Side::Buy, q)).chain(quotes.asks.iter().map(|q| (Side::Sell, q))) {
+            if let Some(req) = self.prepare_order(market, quote.0, quote.1.price, quote.1.size, quotes.reduce_only) {
+                order_reqs.push(req);
             }
         }
 
-        for bid in &quotes.bids {
-            self.place_order(market, Side::Buy, bid.price, bid.size, quotes.reduce_only).await;
-        }
-
-        for ask in &quotes.asks {
-            self.place_order(market, Side::Sell, ask.price, ask.size, quotes.reduce_only).await;
+        // 3. Send all orders in parallel
+        if !order_reqs.is_empty() {
+            let order_futs: Vec<_> = order_reqs.iter().map(|req| {
+                let state = &self.state;
+                let external_id = req.external_id.clone();
+                async move {
+                    match state.adapter.create_order(req).await {
+                        Ok(ack) => {
+                            state.order_tracker.on_rest_response(&external_id, ack.exchange_id);
+                            if !ack.accepted {
+                                warn!(id = %external_id, msg = ?ack.message, "Order rejected by exchange");
+                                state.order_tracker.on_status_update(
+                                    &external_id, OrderStatus::Rejected,
+                                    None, None, None, None,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!(error = %e, id = %external_id, "Order creation failed");
+                            state.circuit_breaker.record_error();
+                            state.order_tracker.on_status_update(
+                                &external_id, OrderStatus::Rejected,
+                                None, None, None, None,
+                            );
+                        }
+                    }
+                }
+            }).collect();
+            futures_util::future::join_all(order_futs).await;
         }
     }
 
-    async fn place_order(&mut self, market: &str, side: Side, price: Decimal, qty: Decimal, reduce_only: bool) {
+    /// Prepare an order request synchronously (risk checks, signing params, tracker registration).
+    /// Returns None if the order is blocked by risk limits.
+    fn prepare_order(&mut self, market: &str, side: Side, price: Decimal, qty: Decimal, reduce_only: bool) -> Option<OrderRequest> {
         // Risk limit checks: skip for reduce-only orders (they decrease exposure)
         if !reduce_only {
             let is_buy = side == Side::Buy;
@@ -369,19 +414,16 @@ impl MarketBot {
                         max_usd = %pos.max_position_usd,
                         "Order blocked: position limit reached"
                     );
-                    return;
+                    return None;
                 }
             }
 
             // Refresh pending exposure from live order tracker before checking.
-            // Without this, pending orders are only synced every 30s in cleanup(),
-            // causing worst-case exposure to be underestimated during rapid requotes.
             let mark = self.state.mark_price.read().unwrap_or(price);
             let (bid_exp, ask_exp) = self.state.order_tracker.pending_exposure(market, mark);
             self.state.exposure_tracker.update_pending_orders(market, bid_exp, ask_exp);
 
-            // Check worst-case exposure (positions + all pending orders filled),
-            // not just gross position, to prevent overexposure from resting orders.
+            // Check worst-case exposure (positions + all pending orders filled).
             let order_notional = qty * price;
             let worst_case = self.state.exposure_tracker.worst_case_exposure_usd();
             if worst_case + order_notional > self.state.exposure_tracker.max_total_usd() {
@@ -392,7 +434,7 @@ impl MarketBot {
                     max = %self.state.exposure_tracker.max_total_usd(),
                     "Order blocked: worst-case exposure limit reached"
                 );
-                return;
+                return None;
             }
         }
 
@@ -422,32 +464,7 @@ impl MarketBot {
         self.state.order_tracker.add_order(&req);
         self.state.circuit_breaker.record_order();
 
-        match self.state.adapter.create_order(&req).await {
-            Ok(ack) => {
-                self.state.order_tracker.on_rest_response(&external_id, ack.exchange_id);
-                if !ack.accepted {
-                    warn!(
-                        id = %external_id,
-                        msg = ?ack.message,
-                        "Order rejected by exchange"
-                    );
-                    self.state.order_tracker.on_status_update(
-                        &external_id,
-                        OrderStatus::Rejected,
-                        None, None, None, None,
-                    );
-                }
-            }
-            Err(e) => {
-                error!(error = %e, id = %external_id, "Order creation failed");
-                self.state.circuit_breaker.record_error();
-                self.state.order_tracker.on_status_update(
-                    &external_id,
-                    OrderStatus::Rejected,
-                    None, None, None, None,
-                );
-            }
-        }
+        Some(req)
     }
 
     fn on_order_update(
