@@ -4,8 +4,7 @@
 //! Amounts are signed: negative for what you give, positive for what you receive.
 
 use anyhow::Result;
-use sha3::{Keccak256, Digest};
-use starknet_crypto::{Felt, PoseidonHasher};
+use starknet_crypto::Felt;
 use extended_types::order::Side;
 use rust_decimal::Decimal;
 use tracing::info;
@@ -39,19 +38,6 @@ impl StarkDomain {
             chain_id: short_string_to_felt("SN_MAIN"),
             revision: Felt::ONE,
         }
-    }
-
-    pub fn hash(&self) -> Felt {
-        // SNIP-12: Poseidon(DOMAIN_SELECTOR, name, version, chain_id, revision)
-        let mut hasher = PoseidonHasher::new();
-        hasher.update(sn_keccak_selector(
-            "\"StarknetDomain\"(\"name\":\"shortstring\",\"version\":\"shortstring\",\"chainId\":\"shortstring\",\"revision\":\"shortstring\")"
-        ));
-        hasher.update(self.name);
-        hasher.update(self.version);
-        hasher.update(self.chain_id);
-        hasher.update(self.revision);
-        hasher.finalize()
     }
 }
 
@@ -91,9 +77,13 @@ pub fn compute_order_hash(
     // Apply sign convention:
     // BUY: receive base (positive), pay quote (negative)
     // SELL: give base (negative), receive quote (positive)
+    let base_i64 = i64::try_from(base_amount)
+        .map_err(|_| anyhow::anyhow!("base_amount {} overflows i64", base_amount))?;
+    let quote_i64 = i64::try_from(quote_amount)
+        .map_err(|_| anyhow::anyhow!("quote_amount {} overflows i64", quote_amount))?;
     let (signed_base, signed_quote): (i64, i64) = match params.side {
-        Side::Buy => (base_amount as i64, -(quote_amount as i64)),
-        Side::Sell => (-(base_amount as i64), quote_amount as i64),
+        Side::Buy => (base_i64, -quote_i64),
+        Side::Sell => (-base_i64, quote_i64),
     };
 
     // Exchange adds 14-day buffer to expiration for L2 settlement.
@@ -160,40 +150,6 @@ fn felt_to_u64(f: &Felt) -> u64 {
     val
 }
 
-/// Compute the type hash for the Order struct (schema selector).
-fn compute_order_type_hash() -> Felt {
-    let mut hasher = PoseidonHasher::new();
-    hasher.update(short_string_to_felt("Order"));
-    hasher.finalize()
-}
-
-/// Compute sn_keccak selector: keccak256 of type string, masked to 250 bits.
-/// Equivalent to Cairo's `selector!()` macro.
-fn sn_keccak_selector(type_str: &str) -> Felt {
-    let mut keccak = Keccak256::new();
-    keccak.update(type_str.as_bytes());
-    let hash = keccak.finalize();
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&hash);
-    // Mask top 6 bits (keep only 250 bits)
-    bytes[0] &= 0x03;
-    Felt::from_bytes_be(&bytes)
-}
-
-/// Convert a signed i128 to Felt.
-/// Negative values use the StarkNet field modulus: PRIME + value.
-fn i128_to_felt(value: i128) -> Felt {
-    if value >= 0 {
-        Felt::from(value as u128)
-    } else {
-        let abs = (-value) as u128;
-        let prime = Felt::from_hex(
-            "0x800000000000011000000000000000000000000000000000000000000000001"
-        ).expect("Invalid prime");
-        prime - Felt::from(abs)
-    }
-}
-
 /// Scale a decimal amount by resolution, rounding up (ceiling).
 fn scale_amount(amount: Decimal, resolution: u64) -> u64 {
     let scaled = amount * Decimal::from(resolution);
@@ -219,35 +175,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_domain_hash_deterministic() {
-        let d1 = StarkDomain::sepolia().hash();
-        let d2 = StarkDomain::sepolia().hash();
-        assert_eq!(d1, d2);
-    }
-
-    #[test]
-    fn test_sepolia_vs_mainnet_different() {
-        let sep = StarkDomain::sepolia().hash();
-        let main = StarkDomain::mainnet().hash();
-        assert_ne!(sep, main);
-    }
-
-    #[test]
     fn test_scale_amount() {
         let result = scale_amount(Decimal::new(1001, 3), 1_000_000);
         assert_eq!(result, 1_001_000);
-    }
-
-    #[test]
-    fn test_i128_to_felt_positive() {
-        let f = i128_to_felt(1390);
-        assert_eq!(f, Felt::from(1390u64));
-    }
-
-    #[test]
-    fn test_i128_to_felt_negative() {
-        let f = i128_to_felt(-1390);
-        assert_ne!(f, Felt::ZERO);
     }
 
     /// Test compute_order_hash against rust-crypto-lib-base's known test vector.
@@ -279,36 +209,6 @@ mod tests {
             "0x4de4c009e0d0c5a70a7da0e2039fb2b99f376d53496f89d9f437e736add6b48"
         ).unwrap();
         assert_eq!(hash, expected, "Hash must match library's test vector");
-    }
-
-    /// Original test kept for reference.
-    #[test]
-    fn test_hash_real_order() {
-        let params = OrderSignParams {
-            position_id: 295450,
-            side: Side::Buy,
-            base_asset_id: "0x4254432d3600000000000000000000".to_string(),
-            quote_asset_id: "0x1".to_string(),
-            base_qty: Decimal::new(137, 5),  // 0.00137
-            quote_qty: Decimal::new(9935240, 2), // 99352.40
-            fee_absolute: Decimal::new(1987148, 5), // 19.87148
-            expiration_epoch_millis: 1774230016000, // will be /1000 = 1774230016... but debugInfo shows 0x69d30f01
-            nonce: 1,
-            collateral_resolution: 1_000_000,
-            synthetic_resolution: 1_000_000,
-        };
-
-        let domain = StarkDomain::mainnet();
-        let pub_key = Felt::from_hex("0x017a2bd6984f6aae5b5963536816ace74e5ed4428877b0eefa66139cfa99c03c").unwrap();
-
-        let hash = compute_order_hash(&params, &domain, &pub_key).unwrap();
-        let expected = Felt::from_hex("0x038921b77c6cb49618120976041b1133f3d03517fb5d2081c660009042ec8e84").unwrap();
-
-        println!("Our hash:      0x{:064x}", hash);
-        println!("Expected hash: 0x{:064x}", expected);
-
-        // For now just print - once we fix the hash this should assert_eq
-        // assert_eq!(hash, expected);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use starknet_crypto::Felt;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::hash::{OrderSignParams, StarkDomain, compute_order_hash};
 use crate::key::{public_key_from_private, grind_key};
@@ -116,12 +116,16 @@ impl StarkSigner for DefaultStarkSigner {
         let s_hex = format!("0x{:064x}", sig.s);
 
         // Verify signature locally before sending to exchange
-        let verify_ok = starknet_crypto::verify(&self.public_key, &msg_hash, &sig.r, &sig.s);
-        info!(
-            r = %r_hex, s = %s_hex,
-            verify_ok = ?verify_ok,
-            "Signature computed + locally verified"
-        );
+        let verify_ok = starknet_crypto::verify(&self.public_key, &msg_hash, &sig.r, &sig.s)
+            .map_err(|e| anyhow::anyhow!("Signature verification error: {}", e))?;
+
+        if !verify_ok {
+            return Err(anyhow::anyhow!(
+                "Local signature verification failed — refusing to send invalid signature"
+            ));
+        }
+
+        info!(r = %r_hex, s = %s_hex, "Signature computed + verified");
 
         Ok(StarkSignature {
             r: r_hex,

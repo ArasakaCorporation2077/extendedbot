@@ -68,13 +68,16 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
                             // Compare l2Key (exchange's registered public key) with our derived key
                             if let Some(ref l2_key) = account_info.l2_key {
                                 let our_key = extended_crypto::StarkSigner::public_key_hex(concrete.as_ref());
+                                // Normalize both: strip 0x, lowercase, strip leading zeros
+                                let normalize = |s: &str| s.strip_prefix("0x").unwrap_or(s).to_lowercase().trim_start_matches('0').to_string();
+                                let keys_match = normalize(l2_key) == normalize(our_key);
                                 info!(
                                     exchange_l2_key = %l2_key,
                                     our_public_key = %our_key,
-                                    keys_match = (l2_key == our_key),
+                                    keys_match,
                                     "Public key comparison"
                                 );
-                                if l2_key != our_key {
+                                if !keys_match {
                                     error!("PUBLIC KEY MISMATCH! Exchange l2Key != our derived key. Signing WILL fail.");
                                 }
                             }

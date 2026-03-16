@@ -42,6 +42,15 @@ impl LocalOrderbook {
         }
     }
 
+    /// Clear the orderbook and mark it as needing a fresh snapshot.
+    pub fn clear(&self) {
+        let mut inner = self.inner.write();
+        inner.bids.clear();
+        inner.asks.clear();
+        inner.sequence = 0;
+        inner.needs_snapshot = true;
+    }
+
     /// Apply a full snapshot (replaces the entire book).
     pub fn apply_snapshot(&self, bids: &[L2Level], asks: &[L2Level], seq: u64) {
         let mut inner = self.inner.write();

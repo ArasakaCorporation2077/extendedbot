@@ -171,7 +171,10 @@ impl MarketBot {
                 }
             }
             BotEvent::ResyncRequested { stream } => {
-                warn!(stream = %stream, "Resync requested after reconnect — state may be stale");
+                warn!(stream = %stream, "Resync requested — clearing orderbook, waiting for snapshot");
+                if stream.contains("Orderbook") {
+                    self.state.orderbook.clear();
+                }
             }
             BotEvent::Shutdown => {
                 info!("Shutdown event received");
