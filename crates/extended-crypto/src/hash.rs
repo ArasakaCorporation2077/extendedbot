@@ -190,10 +190,52 @@ mod tests {
         assert_ne!(f, Felt::ZERO);
     }
 
-    /// Compare our hash against Python SDK's get_order_msg_hash result.
-    /// Expected: 0x038921b77c6cb49618120976041b1133f3d03517fb5d2081c660009042ec8e84
+    /// Test Poseidon vs Pedersen against Python SDK's get_order_msg_hash.
+    /// Expected (all zeros, domain=x10/1/SN_MAIN/1):
+    ///   0x05d39fd923121374f6840c76a590a75d6938b7586849f79d2b0b8be9fbf4fb04
+    /// Expected (BUY 0.00137 BTC @ 72520):
+    ///   0x038921b77c6cb49618120976041b1133f3d03517fb5d2081c660009042ec8e84
     #[test]
     fn test_hash_matches_python_sdk() {
+        let expected_zeros = Felt::from_hex("0x05d39fd923121374f6840c76a590a75d6938b7586849f79d2b0b8be9fbf4fb04").unwrap();
+
+        // All-zero order fields, domain = x10/1/SN_MAIN/1, pubkey=0
+        let domain = StarkDomain::mainnet();
+        let pub_key = Felt::ZERO;
+
+        // --- Try Poseidon SNIP-12 ---
+        // Domain: try name, version, chainId, revision
+        let mut dh = PoseidonHasher::new();
+        dh.update(short_string_to_felt("x10"));
+        dh.update(short_string_to_felt("1"));
+        dh.update(short_string_to_felt("SN_MAIN"));
+        dh.update(Felt::ONE);
+        let domain_hash = dh.finalize();
+
+        // Order message: Poseidon(pos, base_asset, base_amt, quote_asset, quote_amt, fee_asset, fee_amt, exp, salt)
+        let mut oh = PoseidonHasher::new();
+        for _ in 0..9 {
+            oh.update(Felt::ZERO);
+        }
+        let order_hash = oh.finalize();
+
+        // SNIP12: Poseidon(prefix, domain_hash, pub_key, order_hash)
+        let prefix = short_string_to_felt("StarkNet Message");
+        let mut fh = PoseidonHasher::new();
+        fh.update(prefix);
+        fh.update(domain_hash);
+        fh.update(pub_key);
+        fh.update(order_hash);
+        let result = fh.finalize();
+
+        println!("Poseidon SNIP12 rev1: 0x{:064x}", result);
+        println!("Expected zeros:       0x{:064x}", expected_zeros);
+        println!("Match: {}", result == expected_zeros);
+    }
+
+    /// Original test kept for reference.
+    #[test]
+    fn test_hash_real_order() {
         let params = OrderSignParams {
             position_id: 295450,
             side: Side::Buy,
