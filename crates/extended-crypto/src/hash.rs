@@ -9,6 +9,9 @@ use starknet_crypto::{Felt, PoseidonHasher};
 use extended_types::order::Side;
 use rust_decimal::Decimal;
 
+// x10xchange's official crypto lib for order hash computation
+use rust_crypto_lib_base::get_order_hash;
+
 /// Domain separation parameters for StarkNet SNIP12.
 #[derive(Debug, Clone)]
 pub struct StarkDomain {
@@ -73,6 +76,7 @@ pub struct OrderSignParams {
 }
 
 /// Compute the order hash for Extended Exchange signing.
+/// Delegates to x10xchange's official rust-crypto-lib-base for exact hash computation.
 pub fn compute_order_hash(
     params: &OrderSignParams,
     domain: &StarkDomain,
@@ -86,51 +90,54 @@ pub fn compute_order_hash(
     // Apply sign convention:
     // BUY: receive base (positive), pay quote (negative)
     // SELL: give base (negative), receive quote (positive)
-    let (signed_base, signed_quote) = match params.side {
-        Side::Buy => (base_amount as i128, -(quote_amount as i128)),
-        Side::Sell => (-(base_amount as i128), quote_amount as i128),
+    let (signed_base, signed_quote): (i64, i64) = match params.side {
+        Side::Buy => (base_amount as i64, -(quote_amount as i64)),
+        Side::Sell => (-(base_amount as i64), quote_amount as i64),
     };
 
     let expiry_seconds = params.expiration_epoch_millis / 1000;
 
-    // Parse hex asset IDs from l2Config
-    let base_asset_felt = Felt::from_hex(&params.base_asset_id)
-        .map_err(|e| anyhow::anyhow!("Invalid base_asset_id hex: {}", e))?;
-    let quote_asset_felt = Felt::from_hex(&params.quote_asset_id)
-        .map_err(|e| anyhow::anyhow!("Invalid quote_asset_id hex: {}", e))?;
-    let fee_asset_felt = quote_asset_felt; // fee in collateral
+    // Domain strings
+    let domain_name = felt_to_short_string(&domain.name);
+    let domain_version = felt_to_short_string(&domain.version);
+    let domain_chain_id = felt_to_short_string(&domain.chain_id);
+    let domain_revision = format!("{}", felt_to_u64(&domain.revision));
 
-    // SNIP-12 Order struct hash:
-    // Poseidon(ORDER_SELECTOR, position_id, base_asset, base_amount, quote_asset,
-    //          quote_amount, fee_asset, fee_amount, expiration, salt)
-    let order_selector = sn_keccak_selector(
-        "\"Order\"(\"position_id\":\"felt\",\"base_asset_id\":\"felt\",\"base_amount\":\"felt\",\"quote_asset_id\":\"felt\",\"quote_amount\":\"felt\",\"fee_asset_id\":\"felt\",\"fee_amount\":\"felt\",\"expiration\":\"felt\",\"salt\":\"felt\")"
-    );
+    // Call x10's official hash function
+    get_order_hash(
+        params.position_id.to_string(),
+        params.base_asset_id.clone(),
+        signed_base.to_string(),
+        params.quote_asset_id.clone(),
+        signed_quote.to_string(),
+        params.quote_asset_id.clone(), // fee_asset = collateral
+        fee_amount.to_string(),
+        expiry_seconds.to_string(),
+        (params.nonce as u64).to_string(), // salt = nonce
+        format!("0x{:064x}", public_key),
+        domain_name,
+        domain_version,
+        domain_chain_id,
+        domain_revision,
+    ).map_err(|e| anyhow::anyhow!("Order hash computation failed: {}", e))
+}
 
-    let mut hasher = PoseidonHasher::new();
-    hasher.update(order_selector);
-    hasher.update(Felt::from(params.position_id));
-    hasher.update(base_asset_felt);
-    hasher.update(i128_to_felt(signed_base));
-    hasher.update(quote_asset_felt);
-    hasher.update(i128_to_felt(signed_quote));
-    hasher.update(fee_asset_felt);
-    hasher.update(Felt::from(fee_amount));
-    hasher.update(Felt::from(expiry_seconds));
-    hasher.update(Felt::from(params.nonce as u64)); // salt = nonce
-    let struct_hash = hasher.finalize();
+/// Convert a Felt back to a short string.
+fn felt_to_short_string(f: &Felt) -> String {
+    let bytes = f.to_bytes_be();
+    // Find first non-zero byte
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[start..]).to_string()
+}
 
-    // SNIP-12 message hash:
-    // Poseidon("StarkNet Message", domain_hash, public_key, struct_hash)
-    let message_felt = short_string_to_felt("StarkNet Message");
-    let domain_hash = domain.hash();
-
-    let mut final_hasher = PoseidonHasher::new();
-    final_hasher.update(message_felt);
-    final_hasher.update(domain_hash);
-    final_hasher.update(*public_key);
-    final_hasher.update(struct_hash);
-    Ok(final_hasher.finalize())
+/// Convert a Felt to u64.
+fn felt_to_u64(f: &Felt) -> u64 {
+    let bytes = f.to_bytes_be();
+    let mut val = 0u64;
+    for &b in &bytes[24..32] {
+        val = (val << 8) | b as u64;
+    }
+    val
 }
 
 /// Compute the type hash for the Order struct (schema selector).

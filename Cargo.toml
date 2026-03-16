@@ -29,6 +29,9 @@ starknet-crypto = "0.8"
 starknet-types-core = "0.2"
 sha2 = "0.10"
 sha3 = "0.10"
+
+# x10xchange's official crypto lib — provides get_order_hash
+rust-crypto-lib-base = { git = "https://github.com/x10xchange/rust-crypto-lib-base.git", branch = "main" }
 num-bigint = "0.4"
 hex = "0.4"
 rand = "0.8"
