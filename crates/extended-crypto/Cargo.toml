@@ -10,6 +10,7 @@ starknet-types-core = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 sha2 = { workspace = true }
+sha3 = { workspace = true }
 num-bigint = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }

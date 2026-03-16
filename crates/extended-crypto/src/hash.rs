@@ -4,7 +4,8 @@
 //! Amounts are signed: negative for what you give, positive for what you receive.
 
 use anyhow::Result;
-use starknet_crypto::{Felt, PoseidonHasher, pedersen_hash};
+use sha3::{Keccak256, Digest};
+use starknet_crypto::{Felt, PoseidonHasher};
 use extended_types::order::Side;
 use rust_decimal::Decimal;
 
@@ -20,8 +21,8 @@ pub struct StarkDomain {
 impl StarkDomain {
     pub fn sepolia() -> Self {
         Self {
-            name: short_string_to_felt("x10"),
-            version: short_string_to_felt("1"),
+            name: short_string_to_felt("Perpetuals"),
+            version: short_string_to_felt("v0"),
             chain_id: short_string_to_felt("SN_SEPOLIA"),
             revision: Felt::ONE,
         }
@@ -29,18 +30,24 @@ impl StarkDomain {
 
     pub fn mainnet() -> Self {
         Self {
-            name: short_string_to_felt("x10"),
-            version: short_string_to_felt("1"),
+            name: short_string_to_felt("Perpetuals"),
+            version: short_string_to_felt("v0"),
             chain_id: short_string_to_felt("SN_MAIN"),
             revision: Felt::ONE,
         }
     }
 
     pub fn hash(&self) -> Felt {
-        // Pedersen chain: H(H(H(name, version), chain_id), revision)
-        let h = pedersen_hash(&self.name, &self.version);
-        let h = pedersen_hash(&h, &self.chain_id);
-        pedersen_hash(&h, &self.revision)
+        // SNIP-12: Poseidon(DOMAIN_SELECTOR, name, version, chain_id, revision)
+        let mut hasher = PoseidonHasher::new();
+        hasher.update(sn_keccak_selector(
+            "\"StarknetDomain\"(\"name\":\"shortstring\",\"version\":\"shortstring\",\"chainId\":\"shortstring\",\"revision\":\"shortstring\")"
+        ));
+        hasher.update(self.name);
+        hasher.update(self.version);
+        hasher.update(self.chain_id);
+        hasher.update(self.revision);
+        hasher.finalize()
     }
 }
 
@@ -93,24 +100,37 @@ pub fn compute_order_hash(
         .map_err(|e| anyhow::anyhow!("Invalid quote_asset_id hex: {}", e))?;
     let fee_asset_felt = quote_asset_felt; // fee in collateral
 
-    // Build the full hash using Pedersen chain.
-    // Matches rs_get_order_msg parameter order exactly:
-    // position_id, base_asset_id, base_amount, quote_asset_id, quote_amount,
-    // fee_asset_id, fee_amount, expiration, salt,
-    // user_public_key, domain_name, domain_version, domain_chain_id, domain_revision
-    let h = pedersen_hash(&Felt::from(params.position_id), &base_asset_felt);
-    let h = pedersen_hash(&h, &i128_to_felt(signed_base));
-    let h = pedersen_hash(&h, &quote_asset_felt);
-    let h = pedersen_hash(&h, &i128_to_felt(signed_quote));
-    let h = pedersen_hash(&h, &fee_asset_felt);
-    let h = pedersen_hash(&h, &Felt::from(fee_amount));
-    let h = pedersen_hash(&h, &Felt::from(expiry_seconds));
-    let h = pedersen_hash(&h, &Felt::from(params.nonce as u64)); // salt = nonce
-    let h = pedersen_hash(&h, public_key);
-    let h = pedersen_hash(&h, &domain.name);
-    let h = pedersen_hash(&h, &domain.version);
-    let h = pedersen_hash(&h, &domain.chain_id);
-    Ok(pedersen_hash(&h, &domain.revision))
+    // SNIP-12 Order struct hash:
+    // Poseidon(ORDER_SELECTOR, position_id, base_asset, base_amount, quote_asset,
+    //          quote_amount, fee_asset, fee_amount, expiration, salt)
+    let order_selector = sn_keccak_selector(
+        "\"Order\"(\"position_id\":\"felt\",\"base_asset_id\":\"felt\",\"base_amount\":\"felt\",\"quote_asset_id\":\"felt\",\"quote_amount\":\"felt\",\"fee_asset_id\":\"felt\",\"fee_amount\":\"felt\",\"expiration\":\"felt\",\"salt\":\"felt\")"
+    );
+
+    let mut hasher = PoseidonHasher::new();
+    hasher.update(order_selector);
+    hasher.update(Felt::from(params.position_id));
+    hasher.update(base_asset_felt);
+    hasher.update(i128_to_felt(signed_base));
+    hasher.update(quote_asset_felt);
+    hasher.update(i128_to_felt(signed_quote));
+    hasher.update(fee_asset_felt);
+    hasher.update(Felt::from(fee_amount));
+    hasher.update(Felt::from(expiry_seconds));
+    hasher.update(Felt::from(params.nonce as u64)); // salt = nonce
+    let struct_hash = hasher.finalize();
+
+    // SNIP-12 message hash:
+    // Poseidon("StarkNet Message", domain_hash, public_key, struct_hash)
+    let message_felt = short_string_to_felt("StarkNet Message");
+    let domain_hash = domain.hash();
+
+    let mut final_hasher = PoseidonHasher::new();
+    final_hasher.update(message_felt);
+    final_hasher.update(domain_hash);
+    final_hasher.update(*public_key);
+    final_hasher.update(struct_hash);
+    Ok(final_hasher.finalize())
 }
 
 /// Compute the type hash for the Order struct (schema selector).
@@ -118,6 +138,19 @@ fn compute_order_type_hash() -> Felt {
     let mut hasher = PoseidonHasher::new();
     hasher.update(short_string_to_felt("Order"));
     hasher.finalize()
+}
+
+/// Compute sn_keccak selector: keccak256 of type string, masked to 250 bits.
+/// Equivalent to Cairo's `selector!()` macro.
+fn sn_keccak_selector(type_str: &str) -> Felt {
+    let mut keccak = Keccak256::new();
+    keccak.update(type_str.as_bytes());
+    let hash = keccak.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&hash);
+    // Mask top 6 bits (keep only 250 bits)
+    bytes[0] &= 0x03;
+    Felt::from_bytes_be(&bytes)
 }
 
 /// Convert a signed i128 to Felt.
@@ -190,47 +223,49 @@ mod tests {
         assert_ne!(f, Felt::ZERO);
     }
 
-    /// Test Poseidon vs Pedersen against Python SDK's get_order_msg_hash.
+    /// Test against Python SDK's get_order_msg_hash.
     /// Expected (all zeros, domain=x10/1/SN_MAIN/1):
     ///   0x05d39fd923121374f6840c76a590a75d6938b7586849f79d2b0b8be9fbf4fb04
-    /// Expected (BUY 0.00137 BTC @ 72520):
-    ///   0x038921b77c6cb49618120976041b1133f3d03517fb5d2081c660009042ec8e84
     #[test]
     fn test_hash_matches_python_sdk() {
         let expected_zeros = Felt::from_hex("0x05d39fd923121374f6840c76a590a75d6938b7586849f79d2b0b8be9fbf4fb04").unwrap();
 
-        // All-zero order fields, domain = x10/1/SN_MAIN/1, pubkey=0
+        // Use the same hash path as compute_order_hash
         let domain = StarkDomain::mainnet();
         let pub_key = Felt::ZERO;
 
-        // --- Try Poseidon SNIP-12 ---
-        // Domain: try name, version, chainId, revision
-        let mut dh = PoseidonHasher::new();
-        dh.update(short_string_to_felt("x10"));
-        dh.update(short_string_to_felt("1"));
-        dh.update(short_string_to_felt("SN_MAIN"));
-        dh.update(Felt::ONE);
-        let domain_hash = dh.finalize();
+        // Domain hash (using sn_keccak selector)
+        let domain_hash = domain.hash();
+        println!("Domain hash: 0x{:064x}", domain_hash);
 
-        // Order message: Poseidon(pos, base_asset, base_amt, quote_asset, quote_amt, fee_asset, fee_amt, exp, salt)
+        // Order selector
+        let order_sel = sn_keccak_selector(
+            "\"Order\"(\"position_id\":\"felt\",\"base_asset_id\":\"felt\",\"base_amount\":\"felt\",\"quote_asset_id\":\"felt\",\"quote_amount\":\"felt\",\"fee_asset_id\":\"felt\",\"fee_amount\":\"felt\",\"expiration\":\"felt\",\"salt\":\"felt\")"
+        );
+        println!("Order selector: 0x{:064x}", order_sel);
+
+        // Order struct hash with all zeros
         let mut oh = PoseidonHasher::new();
+        oh.update(order_sel);
         for _ in 0..9 {
             oh.update(Felt::ZERO);
         }
-        let order_hash = oh.finalize();
+        let struct_hash = oh.finalize();
+        println!("Struct hash: 0x{:064x}", struct_hash);
 
-        // SNIP12: Poseidon(prefix, domain_hash, pub_key, order_hash)
+        // Final: Poseidon("StarkNet Message", domain_hash, pubkey, struct_hash)
         let prefix = short_string_to_felt("StarkNet Message");
         let mut fh = PoseidonHasher::new();
         fh.update(prefix);
         fh.update(domain_hash);
         fh.update(pub_key);
-        fh.update(order_hash);
+        fh.update(struct_hash);
         let result = fh.finalize();
 
-        println!("Poseidon SNIP12 rev1: 0x{:064x}", result);
-        println!("Expected zeros:       0x{:064x}", expected_zeros);
+        println!("Our hash:      0x{:064x}", result);
+        println!("Expected:      0x{:064x}", expected_zeros);
         println!("Match: {}", result == expected_zeros);
+        assert_eq!(result, expected_zeros, "Hash must match Python SDK");
     }
 
     /// Original test kept for reference.
