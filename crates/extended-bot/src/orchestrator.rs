@@ -65,6 +65,19 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
                             } else {
                                 error!("Account info returned no vault_id — signing will fail");
                             }
+                            // Compare l2Key (exchange's registered public key) with our derived key
+                            if let Some(ref l2_key) = account_info.l2_key {
+                                let our_key = extended_crypto::StarkSigner::public_key_hex(concrete.as_ref());
+                                info!(
+                                    exchange_l2_key = %l2_key,
+                                    our_public_key = %our_key,
+                                    keys_match = (l2_key == our_key),
+                                    "Public key comparison"
+                                );
+                                if l2_key != our_key {
+                                    error!("PUBLIC KEY MISMATCH! Exchange l2Key != our derived key. Signing WILL fail.");
+                                }
+                            }
                         }
                         Err(e) => {
                             error!(error = %e, "Failed to load account info — vault_id remains 0, signing will fail");

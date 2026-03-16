@@ -3,9 +3,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
-use num_bigint::BigUint;
-use rand::RngCore;
 use starknet_crypto::Felt;
+use tracing::{debug, info};
 
 use crate::hash::{OrderSignParams, StarkDomain, compute_order_hash};
 use crate::key::{public_key_from_private, grind_key};
@@ -75,25 +74,6 @@ impl DefaultStarkSigner {
         self.vault_id.store(vault_id, Ordering::SeqCst);
     }
 
-    /// Generate a cryptographically random k value for ECDSA signing.
-    /// k must be in [1, n-1] where n is the StarkCurve order.
-    /// Uses rejection sampling to guarantee k < EC_ORDER.
-    fn random_k() -> Felt {
-        const EC_ORDER_HEX: &str = "0800000000000010ffffffffffffffffb781126dcae7b2321e66a241adc64d2f";
-        let ec_order = BigUint::parse_bytes(EC_ORDER_HEX.as_bytes(), 16)
-            .expect("Failed to parse EC_ORDER");
-
-        let mut rng = rand::thread_rng();
-        loop {
-            let mut k_bytes = [0u8; 32];
-            rng.fill_bytes(&mut k_bytes);
-            let k_int = BigUint::from_bytes_be(&k_bytes);
-
-            if k_int > BigUint::ZERO && k_int < ec_order {
-                return Felt::from_bytes_be(&k_bytes);
-            }
-        }
-    }
 }
 
 impl StarkSigner for DefaultStarkSigner {
@@ -116,20 +96,36 @@ impl StarkSigner for DefaultStarkSigner {
     fn sign_order(&self, params: &OrderSignParams) -> Result<StarkSignature> {
         let msg_hash = compute_order_hash(params, &self.domain, &self.public_key)?;
 
-        // CRITICAL: Use CSPRNG random k for each signature.
-        // Reusing k across signatures leaks the private key.
-        let k = Self::random_k();
+        info!(
+            msg_hash = %format!("0x{:064x}", msg_hash),
+            public_key = %format!("0x{:064x}", self.public_key),
+            position_id = params.position_id,
+            side = ?params.side,
+            base_qty = %params.base_qty,
+            quote_qty = %params.quote_qty,
+            fee = %params.fee_absolute,
+            nonce = params.nonce,
+            "Signing order"
+        );
 
-        let signature = starknet_crypto::sign(
-            &self.private_key,
-            &msg_hash,
-            &k,
-        )
-        .map_err(|e| anyhow::anyhow!("Stark signing failed: {:?}", e))?;
+        // Use x10's official sign_message (deterministic k via ecdsa_sign)
+        let sig = rust_crypto_lib_base::sign_message(&msg_hash, &self.private_key)
+            .map_err(|e| anyhow::anyhow!("Stark signing failed: {}", e))?;
+
+        let r_hex = format!("0x{:064x}", sig.r);
+        let s_hex = format!("0x{:064x}", sig.s);
+
+        // Verify signature locally before sending to exchange
+        let verify_ok = starknet_crypto::verify(&self.public_key, &msg_hash, &sig.r, &sig.s);
+        info!(
+            r = %r_hex, s = %s_hex,
+            verify_ok = ?verify_ok,
+            "Signature computed + locally verified"
+        );
 
         Ok(StarkSignature {
-            r: format!("0x{:064x}", signature.r),
-            s: format!("0x{:064x}", signature.s),
+            r: r_hex,
+            s: s_hex,
         })
     }
 }
@@ -217,10 +213,26 @@ mod tests {
     }
 
     #[test]
-    fn test_random_k_uniqueness() {
-        // Verify that consecutive k values are different (probabilistically)
-        let k1 = DefaultStarkSigner::random_k();
-        let k2 = DefaultStarkSigner::random_k();
-        assert_ne!(k1, k2, "Two consecutive random k values should not be equal");
+    fn test_sign_deterministic() {
+        // Verify that signing the same message with the same key produces the same signature
+        // (ecdsa_sign uses deterministic k)
+        let signer = DefaultStarkSigner::from_eth_key("test_seed_for_determinism", 10001, true).unwrap();
+        let params = OrderSignParams {
+            position_id: 1,
+            side: extended_types::order::Side::Buy,
+            base_asset_id: "0x2".to_string(),
+            quote_asset_id: "0x1".to_string(),
+            base_qty: rust_decimal_macros::dec!(1.0),
+            quote_qty: rust_decimal_macros::dec!(100.0),
+            fee_absolute: rust_decimal_macros::dec!(0.02),
+            expiration_epoch_millis: 1704416937000,
+            nonce: 1,
+            collateral_resolution: 1_000_000,
+            synthetic_resolution: 1_000_000,
+        };
+        let sig1 = signer.sign_order(&params).unwrap();
+        let sig2 = signer.sign_order(&params).unwrap();
+        assert_eq!(sig1.r, sig2.r, "Deterministic signing should produce same r");
+        assert_eq!(sig1.s, sig2.s, "Deterministic signing should produce same s");
     }
 }
