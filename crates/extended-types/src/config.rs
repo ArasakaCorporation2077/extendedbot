@@ -61,6 +61,9 @@ pub struct TradingConfig {
     // Fair price
     #[serde(default = "default_ewma_alpha")]
     pub ewma_alpha: f64,
+    /// Weight given to Binance mid in blended fair price (0.0 = local only, 1.0 = Binance only).
+    #[serde(default = "default_binance_weight")]
+    pub binance_weight: f64,
     #[serde(default = "default_update_threshold")]
     pub update_threshold_bps: f64,
     #[serde(default = "default_min_requote_interval")]
@@ -158,6 +161,7 @@ fn default_leverage() -> u32 { 10 }
 fn default_expiry_days() -> u64 { 7 }
 fn default_dms_timeout() -> u64 { 60000 }
 fn default_ewma_alpha() -> f64 { 0.01 }
+fn default_binance_weight() -> f64 { 0.7 }
 fn default_update_threshold() -> f64 { 3.0 }
 fn default_min_requote_interval() -> u64 { 100 }
 fn default_base_spread() -> f64 { 4.0 }

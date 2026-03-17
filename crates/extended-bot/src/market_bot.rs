@@ -90,8 +90,9 @@ impl MarketBot {
     pub fn new(state: Arc<BotState>) -> Self {
         let tc = &state.config.trading;
 
-        let fair_price_calc = FairPriceCalculator::new(
+        let fair_price_calc = FairPriceCalculator::with_binance_weight(
             Decimal::try_from(tc.ewma_alpha).unwrap_or(dec!(0.01)),
+            Decimal::try_from(tc.binance_weight).unwrap_or(dec!(0.7)),
         );
 
         let spread_calc = SpreadCalculator::new(
@@ -121,6 +122,9 @@ impl MarketBot {
             Decimal::try_from(tc.level_size_decay).unwrap_or(dec!(0.7)),
             tick_size,
             size_step,
+        ).with_best_price_tighten(
+            tc.best_price_tighten_enabled,
+            Decimal::try_from(tc.best_price_margin_bps).unwrap_or(dec!(0.1)),
         );
 
         let vpin_calc = VpinCalculator::new(
@@ -341,15 +345,20 @@ impl MarketBot {
     }
 
     /// Cancel all live orders via mass cancel (single REST call).
-    /// P0-1 FIX: Wait for WebSocket confirmation before returning to prevent
-    /// placing new orders while old orders are still active on exchange.
+    /// P1-1 FIX: Fire-and-forget cancel — no WS wait. Force-mark all pending-cancel
+    /// orders as Cancelled immediately and add a short 50ms delay before the caller
+    /// places new quotes. This eliminates the ~200ms quote gap that the old WS-wait
+    /// approach caused (40% of the 500ms requote cycle).
     async fn cancel_all_live(&self, tick_time: Instant) {
         if self.state.smoke_mode { return; }
         let market = self.state.market();
         if self.state.order_tracker.live_count() == 0 { return; }
 
-        // Mark all as pending cancel
-        for order in &self.state.order_tracker.live_orders(market) {
+        // Mark all as pending cancel and immediately remove from live tracker.
+        // The exchange cancel is fire-and-forget; by the time we submit new quotes
+        // (~50ms later) the exchange will have processed the mass cancel.
+        let live_orders = self.state.order_tracker.live_orders(market);
+        for order in &live_orders {
             self.state.order_tracker.mark_pending_cancel(&order.external_id);
         }
 
@@ -359,40 +368,25 @@ impl MarketBot {
                 self.state.latency.record_cancel_rtt(t0.elapsed().as_micros() as u64);
                 self.state.latency.record_tick_to_cancel(tick_time.elapsed().as_micros() as u64);
 
-                // Wait up to 200ms for WS CANCELLED events to arrive and clear order tracker.
-                // This prevents placing new orders while old orders are still live on exchange.
-                let wait_start = Instant::now();
-                const MAX_WAIT_MS: u64 = 200;
-                while wait_start.elapsed().as_millis() < MAX_WAIT_MS as u128 {
-                    if self.state.order_tracker.live_count() == 0 {
-                        debug!(wait_ms = wait_start.elapsed().as_millis(), "Mass cancel confirmed via WS");
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                if self.state.order_tracker.live_count() > 0 {
-                    let remaining = self.state.order_tracker.live_orders(self.state.market());
-                    warn!(
-                        remaining_orders = remaining.len(),
-                        "Mass cancel WS confirmation timeout — forcing tracker cleanup"
+                // Force-mark orders Cancelled so the tracker is clean before new quotes.
+                // We do not wait for WS confirmation — the REST ACK is sufficient proof
+                // the exchange received the cancel. WS events will arrive asynchronously
+                // but are no-ops because the orders are already in terminal state here.
+                for order in &live_orders {
+                    self.state.order_tracker.on_status_update(
+                        &order.external_id,
+                        OrderStatus::Cancelled,
+                        None, None, None, None,
                     );
-                    // Bug fix: mass_cancel REST call already succeeded on the exchange side.
-                    // The WS confirmation just hasn't arrived yet (or was lost). Leaving these
-                    // orders "live" in the tracker causes the next requote to re-cancel them,
-                    // creating an infinite cancel→timeout→cancel loop. Force-mark them Cancelled
-                    // so the tracker is clean before we place new quotes.
-                    for order in &remaining {
-                        self.state.order_tracker.on_status_update(
-                            &order.external_id,
-                            OrderStatus::Cancelled,
-                            None, None, None, None,
-                        );
-                    }
-                    warn!(force_cancelled = remaining.len(), "Forced tracker cleanup after mass cancel timeout");
                 }
+
+                // Brief pause so the exchange has time to process the cancel before
+                // new orders arrive. 50ms is well within exchange processing latency.
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(e) => {
-                debug!(error = %e, "Mass cancel failed");
+                warn!(error = %e, "Mass cancel failed");
+                self.state.circuit_breaker.record_error();
             }
         }
     }
@@ -451,6 +445,7 @@ impl MarketBot {
                 }
                 Err(e) => {
                     warn!(error = %e, "Fast cancel (mass) failed");
+                    self.state.circuit_breaker.record_error();
                 }
             }
         }
@@ -605,11 +600,15 @@ impl MarketBot {
                 }
             }).collect();
             let results = futures_util::future::join_all(order_futs).await;
-            let success = results.iter().filter(|&&ok| ok).count();
-            if success == 0 {
-                self.consecutive_rejects += 1;
-            } else {
+            let reject_count = results.iter().filter(|&&ok| !ok).count();
+            // P1-2 FIX: Only reset consecutive_rejects when ALL orders succeed.
+            // Partial success (e.g. bid accepted, ask rejected) still indicates
+            // a problem and must not clear the backoff counter.
+            if reject_count == 0 {
                 self.consecutive_rejects = 0;
+            } else {
+                self.consecutive_rejects += 1;
+                warn!(rejects = reject_count, total = results.len(), consecutive = self.consecutive_rejects, "Partial or full order rejection");
             }
         }
     }
@@ -816,6 +815,7 @@ impl MarketBot {
         warn!("Emergency cancel: cancelling all orders");
         if let Err(e) = self.state.adapter.mass_cancel(self.state.market()).await {
             error!(error = %e, "Emergency mass cancel failed");
+            self.state.circuit_breaker.record_error();
         }
     }
 

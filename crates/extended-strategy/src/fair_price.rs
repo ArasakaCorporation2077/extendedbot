@@ -1,15 +1,18 @@
 //! Fair price calculator.
 //!
-//! MVP: local orderbook mid only.
-//! Future: add external reference price with EWMA basis tracking.
+//! Blended fair price: weight_binance * binance_mid + (1 - weight_binance) * local_mid.
+//! Falls back to local_mid when Binance reference is unavailable.
 
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::time::Instant;
 
 pub struct FairPriceCalculator {
+    /// Kept for API compatibility; no longer used in recalculate.
+    #[allow(dead_code)]
     alpha: Decimal,
-    ewma_basis: Option<Decimal>,
+    /// Weight given to Binance mid price (0..1). Remainder goes to local mid.
+    binance_weight: Decimal,
     last_local_mid: Option<Decimal>,
     last_reference_mid: Option<Decimal>,
     fair_price: Option<Decimal>,
@@ -18,9 +21,13 @@ pub struct FairPriceCalculator {
 
 impl FairPriceCalculator {
     pub fn new(alpha: Decimal) -> Self {
+        Self::with_binance_weight(alpha, dec!(0.7))
+    }
+
+    pub fn with_binance_weight(alpha: Decimal, binance_weight: Decimal) -> Self {
         Self {
             alpha,
-            ewma_basis: None,
+            binance_weight,
             last_local_mid: None,
             last_reference_mid: None,
             fair_price: None,
@@ -42,21 +49,19 @@ impl FairPriceCalculator {
 
     fn recalculate(&mut self) -> Option<Decimal> {
         match (self.last_reference_mid, self.last_local_mid) {
-            (Some(ref_mid), Some(local_mid)) => {
-                // Full mode: EWMA basis tracking
-                let basis = ref_mid - local_mid;
-                self.ewma_basis = Some(match self.ewma_basis {
-                    Some(prev) => self.alpha * basis + (Decimal::ONE - self.alpha) * prev,
-                    None => basis,
-                });
-                self.fair_price = Some(ref_mid - self.ewma_basis.unwrap());
+            (Some(binance_mid), Some(local_mid)) => {
+                // Blended fair price: weight_binance * binance + (1 - weight_binance) * local
+                // This keeps the Binance price signal meaningful at all weight values.
+                let fp = self.binance_weight * binance_mid
+                    + (Decimal::ONE - self.binance_weight) * local_mid;
+                self.fair_price = Some(fp);
             }
             (None, Some(local_mid)) => {
-                // MVP mode: local mid only
+                // No Binance reference — fall back to local mid only.
                 self.fair_price = Some(local_mid);
             }
-            (Some(ref_mid), None) => {
-                self.fair_price = Some(ref_mid);
+            (Some(binance_mid), None) => {
+                self.fair_price = Some(binance_mid);
             }
             (None, None) => {
                 return self.fair_price;

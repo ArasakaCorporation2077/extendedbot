@@ -57,6 +57,13 @@ impl QuoteGenerator {
         }
     }
 
+    /// Apply best-price tighten config from trading config fields.
+    pub fn with_best_price_tighten(mut self, enabled: bool, margin_bps: Decimal) -> Self {
+        self.best_price_tighten_enabled = enabled;
+        self.best_price_margin_bps = margin_bps;
+        self
+    }
+
     pub fn generate(&self, input: &QuoteInput) -> GeneratedQuotes {
         let half_spread_ratio = input.spread.half_spread;
         let fp = input.fair_price;
