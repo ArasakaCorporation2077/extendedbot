@@ -83,10 +83,26 @@ impl ExtendedRestClient {
         self.nonce_counter.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// Block until a rate-limit token is available, then consume it.
+    ///
+    /// Proactive: called before every outbound REST request so we never
+    /// send more than the exchange allows. Loops with progressively longer
+    /// sleeps if the bucket is empty or we are in 429-backoff.
     async fn rate_limit_wait(&self) {
-        if let Some(wait) = self.rate_limiter.try_acquire() {
-            warn!(wait_ms = wait.as_millis(), "Rate limited, waiting");
-            tokio::time::sleep(wait).await;
+        loop {
+            match self.rate_limiter.try_acquire() {
+                None => return, // Token acquired — proceed with the request.
+                Some(wait) => {
+                    warn!(
+                        wait_ms = wait.as_millis(),
+                        tokens = self.rate_limiter.available_tokens(),
+                        "Rate limiter: waiting for token"
+                    );
+                    tokio::time::sleep(wait).await;
+                    // Loop back and try again — another coroutine may have consumed
+                    // the token that just became available.
+                }
+            }
         }
     }
 

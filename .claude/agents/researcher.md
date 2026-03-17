@@ -93,3 +93,7 @@ These are pre-vetted, high-quality sources. Always check these first before gene
 - Never make up API behavior — if uncertain, say so
 - Check curated sources before doing general web search
 - When referencing GitHub repos, include specific file paths and line numbers when possible
+- **CRITICAL: Send partial results to team-lead after EVERY source you check.** Do not wait until all research is done. Send a message after each URL/file with what you found so far.
+- **CRITICAL: Never spend more than 2 minutes on a single URL.** If a page is slow or complex, skip it and move on.
+- **CRITICAL: Max 3 URLs per research task.** Be selective — pick the most relevant sources only.
+- If team-lead sends a message while you are working, stop immediately and respond.

@@ -79,6 +79,7 @@ pub struct MarketBot {
     vol_estimator: VolatilityEstimator,
     fast_cancel: FastCancel,
     last_requote: Instant,
+    last_fast_cancel: Option<Instant>,
     last_binance_tick: Option<Instant>,
     last_quoted_fp: Option<Decimal>,
     consecutive_rejects: u32,
@@ -142,6 +143,7 @@ impl MarketBot {
             vol_estimator: VolatilityEstimator::new(50),
             fast_cancel,
             last_requote: Instant::now(),
+            last_fast_cancel: None,
             last_binance_tick: None,
             last_quoted_fp: None,
             consecutive_rejects: 0,
@@ -381,15 +383,29 @@ impl MarketBot {
         }
     }
 
-    async fn check_fast_cancel(&self, fair_price: Decimal, tick_time: Instant) {
+    async fn check_fast_cancel(&mut self, fair_price: Decimal, tick_time: Instant) {
         if self.state.smoke_mode { return; }
+
+        // Debounce: fast cancel은 최소 1초 간격으로만
+        if let Some(last) = self.last_fast_cancel {
+            if last.elapsed() < Duration::from_millis(1000) {
+                return;
+            }
+        }
 
         let best_bid = self.state.orderbook.best_bid().map(|l| l.price);
         let best_ask = self.state.orderbook.best_ask().map(|l| l.price);
 
         let live_orders = self.state.order_tracker.live_orders(self.state.market());
 
+        // Collect which orders need cancelling before touching state.
+        let mut any_cancel = false;
         for order in &live_orders {
+            // Skip orders already pending cancel — no need to send another cancel request.
+            if order.status == OrderStatus::PendingCancel {
+                continue;
+            }
+
             let info = LiveOrderInfo {
                 order_price: order.price,
                 is_buy: order.side == Side::Buy,
@@ -403,14 +419,24 @@ impl MarketBot {
                     "Fast cancel triggered"
                 );
                 self.state.order_tracker.mark_pending_cancel(&order.external_id);
-                let t0 = Instant::now();
-                if let Err(e) = self.state.adapter.cancel_order_by_external_id(&order.external_id).await {
-                    warn!(error = %e, "Fast cancel failed");
-                } else {
+                any_cancel = true;
+            }
+        }
+
+        // Use a single mass_cancel instead of one DELETE per order.
+        // This costs 1 req regardless of how many orders are live (vs N individual DELETEs).
+        if any_cancel {
+            self.last_fast_cancel = Some(Instant::now());
+            let t0 = Instant::now();
+            match self.state.adapter.mass_cancel(self.state.market()).await {
+                Ok(_) => {
                     let cancel_rtt = t0.elapsed().as_micros() as u64;
                     let tick_to_cancel = tick_time.elapsed().as_micros() as u64;
                     self.state.latency.record_cancel_rtt(cancel_rtt);
                     self.state.latency.record_tick_to_cancel(tick_to_cancel);
+                }
+                Err(e) => {
+                    warn!(error = %e, "Fast cancel (mass) failed");
                 }
             }
         }
