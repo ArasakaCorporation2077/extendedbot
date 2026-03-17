@@ -658,9 +658,13 @@ impl MarketBot {
             self.state.exposure_tracker.update_pending_orders(market, bid_exp, ask_exp);
 
             // Check worst-case exposure INCLUDING this order AND all previously prepared orders in this batch.
+            // Only BUY orders increase long exposure; SELL orders reduce it (or increase short exposure,
+            // but worst_case already accounts for the position direction via max(|pos+bids|, |pos-asks|)).
+            // batch_exposure_usd accumulates only BUY-side notional so SELL orders are never blocked here.
             let order_notional = qty * price;
             let worst_case = self.state.exposure_tracker.worst_case_exposure_usd();
-            if worst_case + *batch_exposure_usd + order_notional > self.state.exposure_tracker.max_total_usd() {
+            let batch_contribution = if is_buy { *batch_exposure_usd + order_notional } else { Decimal::ZERO };
+            if worst_case + batch_contribution > self.state.exposure_tracker.max_total_usd() {
                 debug!(
                     side = %side,
                     order_usd = %order_notional,
@@ -672,8 +676,10 @@ impl MarketBot {
                 return None;
             }
 
-            // Add this order's exposure to the running batch total
-            *batch_exposure_usd += order_notional;
+            // Add this order's exposure to the running batch total (BUY orders only)
+            if is_buy {
+                *batch_exposure_usd += order_notional;
+            }
         }
 
         self.order_seq += 1;
