@@ -343,22 +343,32 @@ impl ExtendedWebSocket {
                 };
 
                 if let Some(orders) = wrapper.orders {
-                    for update in orders {
-                        let status = parse_order_status(&update.status);
-                        let exchange_id = update.id.map(|id| id.to_string());
-                        let remaining = match (&update.filled_qty, &update.qty) {
-                            (Some(filled), qty) => Some(*qty - *filled),
-                            _ => None,
-                        };
-                        let _ = event_tx.send(BotEvent::OrderUpdate {
-                            external_id: update.external_id.unwrap_or_default(),
-                            exchange_id,
-                            status,
-                            filled_qty: update.filled_qty,
-                            remaining_qty: remaining,
-                            avg_fill_price: update.average_price,
-                            ts: update.updated_time.or(update.created_time).unwrap_or(0),
-                        });
+                    // Bug fix: empty SNAPSHOT orders array must not be treated as "no orders on exchange".
+                    // Exchange sends empty snapshot on Private WS reconnect before the real snapshot arrives.
+                    // Sending zero OrderUpdate events from an empty snapshot would leave the tracker
+                    // intact — which is correct — but the key point is we must NOT infer cancellation
+                    // from absence. Skip order processing for empty snapshots entirely.
+                    if msg_type == "SNAPSHOT" && orders.is_empty() {
+                        warn!("Private WS SNAPSHOT received with empty orders array — ignoring to prevent ghost order accumulation");
+                        // positions/trades/balance from this snapshot are still processed below
+                    } else {
+                        for update in orders {
+                            let status = parse_order_status(&update.status);
+                            let exchange_id = update.id.map(|id| id.to_string());
+                            let remaining = match (&update.filled_qty, &update.qty) {
+                                (Some(filled), qty) => Some(*qty - *filled),
+                                _ => None,
+                            };
+                            let _ = event_tx.send(BotEvent::OrderUpdate {
+                                external_id: update.external_id.unwrap_or_default(),
+                                exchange_id,
+                                status,
+                                filled_qty: update.filled_qty,
+                                remaining_qty: remaining,
+                                avg_fill_price: update.average_price,
+                                ts: update.updated_time.or(update.created_time).unwrap_or(0),
+                            });
+                        }
                     }
                 }
 

@@ -371,10 +371,24 @@ impl MarketBot {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 if self.state.order_tracker.live_count() > 0 {
+                    let remaining = self.state.order_tracker.live_orders(self.state.market());
                     warn!(
-                        remaining_orders = self.state.order_tracker.live_count(),
-                        "Mass cancel WS confirmation timeout — orders may still be live"
+                        remaining_orders = remaining.len(),
+                        "Mass cancel WS confirmation timeout — forcing tracker cleanup"
                     );
+                    // Bug fix: mass_cancel REST call already succeeded on the exchange side.
+                    // The WS confirmation just hasn't arrived yet (or was lost). Leaving these
+                    // orders "live" in the tracker causes the next requote to re-cancel them,
+                    // creating an infinite cancel→timeout→cancel loop. Force-mark them Cancelled
+                    // so the tracker is clean before we place new quotes.
+                    for order in &remaining {
+                        self.state.order_tracker.on_status_update(
+                            &order.external_id,
+                            OrderStatus::Cancelled,
+                            None, None, None, None,
+                        );
+                    }
+                    warn!(force_cancelled = remaining.len(), "Forced tracker cleanup after mass cancel timeout");
                 }
             }
             Err(e) => {
