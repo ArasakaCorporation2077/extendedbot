@@ -17,6 +17,8 @@ use extended_risk::position_manager::PositionManager;
 use extended_types::config::AppConfig;
 use extended_types::events::BotEvent;
 
+use crate::fill_logger::FillLogger;
+
 /// All shared state for the bot, passed around as Arc<BotState>.
 pub struct BotState {
     pub config: AppConfig,
@@ -37,6 +39,8 @@ pub struct BotState {
     pub index_price: RwLock<Option<Decimal>>,
     pub binance_mid: RwLock<Option<Decimal>>,
     pub smoke_mode: bool,
+    /// fills.jsonl logger
+    pub fill_logger: FillLogger,
     /// Market tick size from exchange metadata.
     pub tick_size: RwLock<Decimal>,
     /// Market size step from exchange metadata.
@@ -60,6 +64,7 @@ impl BotState {
         };
 
         Arc::new(Self {
+            fill_logger: FillLogger::new(&std::path::PathBuf::from("fills.jsonl")),
             order_tracker: OrderTracker::new(),
             orderbook: LocalOrderbook::new(),
             position_manager: PositionManager::new(config.risk.max_position_usd),

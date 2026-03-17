@@ -90,9 +90,8 @@ impl MarketBot {
     pub fn new(state: Arc<BotState>) -> Self {
         let tc = &state.config.trading;
 
-        let fair_price_calc = FairPriceCalculator::with_binance_weight(
+        let fair_price_calc = FairPriceCalculator::new(
             Decimal::try_from(tc.ewma_alpha).unwrap_or(dec!(0.01)),
-            Decimal::try_from(tc.binance_weight).unwrap_or(dec!(0.7)),
         );
 
         let spread_calc = SpreadCalculator::new(
@@ -339,8 +338,18 @@ impl MarketBot {
         let _ = self.state.book_notify.send(seq);
 
         if should_requote {
-            info!(fair_price = %fp, mid = %mid, change_bps = %price_change, has_orders = has_live_orders, "Requoting");
-            self.requote(fp, tick_time).await;
+            // quote_price = fair_price + basis_offset (lands on x10 orderbook)
+            let quote_price = self.fair_price_calc.quote_price().unwrap_or(fp);
+            info!(
+                fair_price = %fp,
+                quote_price = %quote_price,
+                basis_offset = %self.fair_price_calc.basis_offset(),
+                mid = %mid,
+                change_bps = %price_change,
+                has_orders = has_live_orders,
+                "Requoting"
+            );
+            self.requote(quote_price, tick_time).await;
         }
     }
 
@@ -808,6 +817,30 @@ impl MarketBot {
             realized = %realized,
             "Fill"
         );
+
+        // Log to fills.jsonl for offline analysis
+        let order_to_fill_ms = tracked.as_ref().map(|o| {
+            o.timestamps.local_send.elapsed().as_millis() as u64
+        });
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.state.fill_logger.log(&crate::fill_logger::FillRecord {
+            ts_ms,
+            market: market.clone(),
+            external_id: external_id.to_string(),
+            side: if side_is_buy { "buy".to_string() } else { "sell".to_string() },
+            price,
+            qty,
+            fee,
+            is_maker,
+            realized_pnl: realized,
+            fair_price: self.fair_price_calc.quote_price(),
+            local_mid: self.state.orderbook.mid(),
+            binance_mid: *self.state.binance_mid.read(),
+            order_to_fill_ms,
+        });
     }
 
     async fn emergency_cancel(&self) {

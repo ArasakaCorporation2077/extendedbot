@@ -156,6 +156,72 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
         if let Err(e) = bootstrap_state(&state).await {
             error!(error = %e, "State bootstrap failed, continuing with defaults");
         }
+
+        // 4b. Auto-flatten if existing position exceeds max_position_usd at startup.
+        //     This prevents the bot from being stuck unable to quote after a restart
+        //     with a large leftover position.
+        let max_pos = Decimal::try_from(config.risk.max_position_usd).unwrap_or(dec!(500));
+        if let Some(pos) = state.position_manager.get_position(state.market()) {
+            let notional = pos.size.abs() * pos.mark_price;
+            let ratio = if max_pos > Decimal::ZERO { notional / max_pos } else { Decimal::ZERO };
+            if ratio > dec!(0.5) {
+                warn!(
+                    notional = %notional,
+                    max_pos = %max_pos,
+                    ratio = %ratio,
+                    "Startup: position exceeds 50% of max — auto-flattening before quoting"
+                );
+                // Reuse close_all logic inline: mass cancel + market close
+                match state.adapter.mass_cancel(state.market()).await {
+                    Ok(_) => info!("Startup flatten: mass cancel sent"),
+                    Err(e) => warn!(error = %e, "Startup flatten: mass cancel failed"),
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if let Ok(positions) = state.adapter.get_positions().await {
+                    for p in &positions {
+                        if p.size == Decimal::ZERO { continue; }
+                        let signed = match p.side.as_deref() {
+                            Some("short") | Some("SHORT") | Some("SELL") => -p.size.abs(),
+                            _ => p.size.abs(),
+                        };
+                        let (side, side_str) = if signed > Decimal::ZERO {
+                            (extended_types::order::Side::Sell, "SELL")
+                        } else {
+                            (extended_types::order::Side::Buy, "BUY")
+                        };
+                        let mark = p.mark_price.unwrap_or(p.entry_price);
+                        let slippage = if signed > Decimal::ZERO { dec!(0.995) } else { dec!(1.005) };
+                        let close_price = (mark * slippage).round_dp(0);
+                        info!(market = %p.market, side = side_str, qty = %p.size, price = %close_price, "Startup flatten: closing position");
+                        let close_req = extended_types::order::OrderRequest {
+                            external_id: format!("emm-close-startup-{}", uuid::Uuid::new_v4().simple()),
+                            market: p.market.clone(),
+                            side,
+                            price: close_price,
+                            qty: p.size.abs(),
+                            order_type: extended_types::order::OrderType::Limit,
+                            post_only: false,
+                            reduce_only: true,
+                            time_in_force: extended_types::order::TimeInForce::Gtt,
+                            max_fee: dec!(0.001),
+                            expiry_epoch_millis: (std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64) + 300_000,
+                            cancel_id: None,
+                        };
+                        match state.adapter.create_order(&close_req).await {
+                            Ok(r) if r.accepted => info!("Startup flatten: close order accepted"),
+                            Ok(r) => warn!(msg = ?r.message, "Startup flatten: close order rejected"),
+                            Err(e) => error!(error = %e, "Startup flatten: close order failed"),
+                        }
+                    }
+                }
+                // Wait for fill
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                info!("Startup flatten complete");
+            }
+        }
     }
 
     // 5. Spawn WS connections (always — paper mode needs live market data for check_fills)
