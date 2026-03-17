@@ -658,26 +658,37 @@ impl MarketBot {
             self.state.exposure_tracker.update_pending_orders(market, bid_exp, ask_exp);
 
             // Check worst-case exposure INCLUDING this order AND all previously prepared orders in this batch.
-            // Only BUY orders increase long exposure; SELL orders reduce it (or increase short exposure,
-            // but worst_case already accounts for the position direction via max(|pos+bids|, |pos-asks|)).
-            // batch_exposure_usd accumulates only BUY-side notional so SELL orders are never blocked here.
+            // worst_case already accounts for direction via max(|pos+bids|, |pos-asks|).
+            // An order INCREASES worst-case only if it goes in the same direction as the dominant exposure side.
+            // - LONG position dominant: BUY increases it, SELL reduces it → only BUY contributes to batch
+            // - SHORT position dominant: SELL increases it, BUY reduces it → only SELL contributes to batch
             let order_notional = qty * price;
             let worst_case = self.state.exposure_tracker.worst_case_exposure_usd();
-            let batch_contribution = if is_buy { *batch_exposure_usd + order_notional } else { Decimal::ZERO };
+            let net_position = self.state.exposure_tracker.net_exposure_usd();
+            // Order increases exposure if same direction as net position (or net=0, both sides add exposure)
+            let increases_exposure = if net_position > Decimal::ZERO {
+                is_buy
+            } else if net_position < Decimal::ZERO {
+                !is_buy
+            } else {
+                true // flat: both directions add exposure
+            };
+            let batch_contribution = if increases_exposure { *batch_exposure_usd + order_notional } else { Decimal::ZERO };
             if worst_case + batch_contribution > self.state.exposure_tracker.max_total_usd() {
                 debug!(
                     side = %side,
                     order_usd = %order_notional,
                     batch_usd = %batch_exposure_usd,
                     worst_case = %worst_case,
+                    net_position = %net_position,
                     max = %self.state.exposure_tracker.max_total_usd(),
                     "Order blocked: worst-case exposure limit (with batch) reached"
                 );
                 return None;
             }
 
-            // Add this order's exposure to the running batch total (BUY orders only)
-            if is_buy {
+            // Accumulate batch exposure only for orders that increase worst-case
+            if increases_exposure {
                 *batch_exposure_usd += order_notional;
             }
         }
