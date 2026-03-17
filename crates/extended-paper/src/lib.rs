@@ -315,6 +315,9 @@ impl ExchangeAdapter for PaperExchange {
                 reduce_only: Some(o.reduce_only),
                 time_in_force: Some("GTT".into()),
                 created_at: None,
+                average_price: None,
+                payed_fee: None,
+                account_id: None,
             })
             .collect())
     }

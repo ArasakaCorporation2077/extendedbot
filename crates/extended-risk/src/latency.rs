@@ -115,6 +115,11 @@ impl LatencyTracker {
         self.order_to_fill.lock().record(us);
     }
 
+    /// Return the most recent order RTT sample in microseconds, if any.
+    pub fn last_order_rtt_us(&self) -> Option<u64> {
+        self.order_rtt.lock().samples.last().copied()
+    }
+
     /// Log summary and reset all buckets.
     pub fn log_summary(&self) {
         let buckets: [(&Mutex<LatencyBucket>, &str); 7] = [

@@ -16,9 +16,20 @@ pub struct CircuitBreakerConfig {
     pub cooldown_s: u64,
 }
 
+/// Categorises why the circuit breaker tripped.
+/// DailyLoss trips are permanent for the session — they must never auto-reset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TripType {
+    DailyLoss,
+    ErrorRate,
+    OrderRate,
+    Manual,
+}
+
 struct CircuitBreakerState {
     daily_pnl: Decimal,
     is_tripped: bool,
+    trip_type: Option<TripType>,
     trip_reason: Option<String>,
     tripped_at: Option<Instant>,
     recent_errors: VecDeque<Instant>,
@@ -38,6 +49,7 @@ impl CircuitBreaker {
             state: RwLock::new(CircuitBreakerState {
                 daily_pnl: Decimal::ZERO,
                 is_tripped: false,
+                trip_type: None,
                 trip_reason: None,
                 tripped_at: None,
                 recent_errors: VecDeque::new(),
@@ -50,6 +62,12 @@ impl CircuitBreaker {
     pub fn is_trading_allowed(&self) -> bool {
         let state = self.state.read();
         if !state.is_tripped { return true; }
+
+        // DailyLoss trips are permanent for the session — never auto-reset.
+        if state.trip_type == Some(TripType::DailyLoss) {
+            return false;
+        }
+
         if let Some(tripped_at) = state.tripped_at {
             if tripped_at.elapsed().as_secs() > self.config.cooldown_s {
                 drop(state);
@@ -78,8 +96,9 @@ impl CircuitBreaker {
     pub fn record_pnl(&self, pnl: Decimal) {
         let mut state = self.state.write();
         state.daily_pnl += pnl;
-        if state.daily_pnl < -self.config.max_daily_loss_usd {
+        if state.daily_pnl < -self.config.max_daily_loss_usd && !state.is_tripped {
             state.is_tripped = true;
+            state.trip_type = Some(TripType::DailyLoss);
             state.trip_reason = Some(format!(
                 "Daily loss limit breached: ${} (limit: ${})",
                 state.daily_pnl, self.config.max_daily_loss_usd
@@ -97,8 +116,9 @@ impl CircuitBreaker {
                 state.recent_errors.pop_front();
             } else { break; }
         }
-        if state.recent_errors.len() as u32 > self.config.max_errors_per_minute {
+        if state.recent_errors.len() as u32 > self.config.max_errors_per_minute && !state.is_tripped {
             state.is_tripped = true;
+            state.trip_type = Some(TripType::ErrorRate);
             state.trip_reason = Some(format!(
                 "Error rate exceeded: {}/min (limit: {})",
                 state.recent_errors.len(), self.config.max_errors_per_minute
@@ -116,8 +136,9 @@ impl CircuitBreaker {
                 state.recent_orders.pop_front();
             } else { break; }
         }
-        if state.recent_orders.len() as u32 > self.config.max_orders_per_minute {
+        if state.recent_orders.len() as u32 > self.config.max_orders_per_minute && !state.is_tripped {
             state.is_tripped = true;
+            state.trip_type = Some(TripType::OrderRate);
             state.trip_reason = Some("Order rate limit exceeded".to_string());
             state.tripped_at = Some(Instant::now());
         }
@@ -126,6 +147,7 @@ impl CircuitBreaker {
     pub fn trip(&self, reason: &str) {
         let mut state = self.state.write();
         state.is_tripped = true;
+        state.trip_type = Some(TripType::Manual);
         state.trip_reason = Some(reason.to_string());
         state.tripped_at = Some(Instant::now());
     }
@@ -133,6 +155,7 @@ impl CircuitBreaker {
     pub fn reset(&self) {
         let mut state = self.state.write();
         state.is_tripped = false;
+        state.trip_type = None;
         state.trip_reason = None;
         state.tripped_at = None;
     }
@@ -181,5 +204,19 @@ mod tests {
         assert!(!cb.is_trading_allowed());
         cb.reset();
         assert!(cb.is_trading_allowed());
+    }
+
+    #[test]
+    fn test_daily_loss_no_auto_reset() {
+        let cb = CircuitBreaker::new(test_config());
+        cb.record_pnl(dec!(-5001));
+        assert!(!cb.is_trading_allowed());
+        // DailyLoss trip type must be reflected in status and must not auto-reset.
+        assert!(matches!(cb.status(), BreakerStatus::Tripped(_)));
+        // Calling is_trading_allowed() repeatedly must never return true without
+        // an explicit reset() — the DailyLoss guard prevents auto-reset.
+        for _ in 0..3 {
+            assert!(!cb.is_trading_allowed());
+        }
     }
 }

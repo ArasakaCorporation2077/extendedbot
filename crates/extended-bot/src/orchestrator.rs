@@ -161,16 +161,26 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
     // 5. Spawn WS connections (always — paper mode needs live market data for check_fills)
     let ws_handles = spawn_ws_connections(&config, state.event_tx.clone()).await;
 
-    // 5b. Spawn Binance reference price feed
+    // 5b. Spawn Binance reference price feed with auto-reconnection
+    // P0-2 FIX: BinanceWs::run() already has infinite reconnection loop,
+    // but we wrap it in another loop to handle panics and ensure it never dies.
     {
         let binance_ws = extended_exchange::BinanceWs::from_market(state.market());
         let tx = state.event_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = binance_ws.run(tx).await {
-                error!(error = %e, "Binance WS exited");
+            loop {
+                match binance_ws.run(tx.clone()).await {
+                    Ok(()) => {
+                        error!("Binance WS run() returned Ok (should never happen), restarting...");
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Binance WS run() exited with error, restarting in 5s...");
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
-        info!("Binance bookTicker feed spawned");
+        info!("Binance bookTicker feed spawned with auto-restart wrapper");
     }
 
     // 6. Activate dead man's switch (live only, not smoke)

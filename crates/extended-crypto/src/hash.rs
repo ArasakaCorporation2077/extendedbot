@@ -69,18 +69,25 @@ pub fn compute_order_hash(
     domain: &StarkDomain,
     public_key: &Felt,
 ) -> Result<Felt> {
-    // Scale amounts by resolution
-    let base_amount = scale_amount(params.base_qty, params.synthetic_resolution);
-    let quote_amount = scale_amount(params.quote_qty, params.collateral_resolution);
-    let fee_amount = scale_amount(params.fee_absolute, params.collateral_resolution);
+    // Scale amounts by resolution — returns Err on u64 overflow
+    let base_amount = scale_amount(params.base_qty, params.synthetic_resolution)?;
+    let quote_amount = scale_amount(params.quote_qty, params.collateral_resolution)?;
+    let fee_amount = scale_amount(params.fee_absolute, params.collateral_resolution)?;
 
     // Apply sign convention:
     // BUY: receive base (positive), pay quote (negative)
     // SELL: give base (negative), receive quote (positive)
+    // P0-5 & P0-6 FIX: Check for overflow before negation and i64 conversion
     let base_i64 = i64::try_from(base_amount)
         .map_err(|_| anyhow::anyhow!("base_amount {} overflows i64", base_amount))?;
     let quote_i64 = i64::try_from(quote_amount)
         .map_err(|_| anyhow::anyhow!("quote_amount {} overflows i64", quote_amount))?;
+
+    // Check for i64::MIN before negation (i64::MIN.abs() overflows)
+    if base_i64 == i64::MIN || quote_i64 == i64::MIN {
+        return Err(anyhow::anyhow!("Cannot negate i64::MIN (overflow protection)"));
+    }
+
     let (signed_base, signed_quote): (i64, i64) = match params.side {
         Side::Buy => (base_i64, -quote_i64),
         Side::Sell => (-base_i64, quote_i64),
@@ -151,11 +158,12 @@ fn felt_to_u64(f: &Felt) -> u64 {
 }
 
 /// Scale a decimal amount by resolution, rounding up (ceiling).
-fn scale_amount(amount: Decimal, resolution: u64) -> u64 {
+/// Returns Err if the result overflows u64, preventing a panic on extreme inputs.
+fn scale_amount(amount: Decimal, resolution: u64) -> Result<u64> {
     let scaled = amount * Decimal::from(resolution);
     let rounded = scaled.ceil();
     rounded.to_string().parse::<u64>()
-        .unwrap_or_else(|_| panic!(
+        .map_err(|_| anyhow::anyhow!(
             "scale_amount overflow: {} * {} = {} does not fit u64",
             amount, resolution, rounded
         ))
@@ -176,7 +184,7 @@ mod tests {
 
     #[test]
     fn test_scale_amount() {
-        let result = scale_amount(Decimal::new(1001, 3), 1_000_000);
+        let result = scale_amount(Decimal::new(1001, 3), 1_000_000).unwrap();
         assert_eq!(result, 1_001_000);
     }
 

@@ -21,6 +21,54 @@ use extended_types::order::{OrderRequest, OrderStatus, OrderType, Side, TimeInFo
 
 use crate::state::BotState;
 
+/// Rolling realized-volatility estimator over the last N trade prices.
+/// Returns annualized std-dev in bps relative to the mean price.
+struct VolatilityEstimator {
+    prices: std::collections::VecDeque<Decimal>,
+    max_samples: usize,
+}
+
+impl VolatilityEstimator {
+    fn new(max_samples: usize) -> Self {
+        Self { prices: std::collections::VecDeque::with_capacity(max_samples + 1), max_samples }
+    }
+
+    fn on_trade(&mut self, price: Decimal) {
+        self.prices.push_back(price);
+        if self.prices.len() > self.max_samples {
+            self.prices.pop_front();
+        }
+    }
+
+    /// Returns realized vol in bps (std-dev / mean * 10_000).
+    /// Returns zero if fewer than 2 samples.
+    fn volatility_bps(&self) -> Decimal {
+        let n = self.prices.len();
+        if n < 2 { return Decimal::ZERO; }
+        let n_d = Decimal::from(n as u64);
+        let mean = self.prices.iter().copied().sum::<Decimal>() / n_d;
+        if mean.is_zero() { return Decimal::ZERO; }
+        let variance = self.prices.iter()
+            .map(|p| { let d = p - mean; d * d })
+            .sum::<Decimal>() / Decimal::from((n - 1) as u64);
+        // sqrt via Newton-Raphson (Decimal has no built-in sqrt)
+        let stdev = decimal_sqrt(variance);
+        (stdev / mean) * dec!(10000)
+    }
+}
+
+/// Newton-Raphson sqrt for Decimal. Returns 0 for non-positive inputs.
+fn decimal_sqrt(x: Decimal) -> Decimal {
+    if x <= Decimal::ZERO { return Decimal::ZERO; }
+    let mut guess = x / dec!(2);
+    for _ in 0..20 {
+        let next = (guess + x / guess) / dec!(2);
+        if (next - guess).abs() < dec!(0.000001) { return next; }
+        guess = next;
+    }
+    guess
+}
+
 pub struct MarketBot {
     state: Arc<BotState>,
     fair_price_calc: FairPriceCalculator,
@@ -28,6 +76,7 @@ pub struct MarketBot {
     skew_calc: SkewCalculator,
     quote_gen: QuoteGenerator,
     vpin_calc: VpinCalculator,
+    vol_estimator: VolatilityEstimator,
     fast_cancel: FastCancel,
     last_requote: Instant,
     last_binance_tick: Option<Instant>,
@@ -90,6 +139,7 @@ impl MarketBot {
             skew_calc,
             quote_gen,
             vpin_calc,
+            vol_estimator: VolatilityEstimator::new(50),
             fast_cancel,
             last_requote: Instant::now(),
             last_binance_tick: None,
@@ -110,6 +160,7 @@ impl MarketBot {
                 if market == self.state.market() {
                     for trade in &trades {
                         self.vpin_calc.on_trade(trade.size, !trade.is_buyer_maker);
+                        self.vol_estimator.on_trade(trade.price);
                     }
                 }
             }
@@ -173,18 +224,8 @@ impl MarketBot {
                     );
                 }
 
-                // Record fill for markout evaluation — skip if side unknown
-                if let Some(mid) = self.state.orderbook.mid() {
-                    if let Some(order) = self.state.order_tracker.get_by_external_id(&resolved_ext_id) {
-                        let is_buy = order.side == extended_types::order::Side::Buy;
-                        let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
-                        self.state.markout.record_fill(
-                            self.state.market(), price, is_buy, mid, bn_mid,
-                        );
-                    } else {
-                        warn!(id = %resolved_ext_id, "Skipping markout: order not found in tracker");
-                    }
-                }
+                // P0-7 FIX: Markout recording moved to on_order_update (FILLED status)
+                // to avoid double-counting. Fill events are unreliable on x10.
                 self.on_fill(&resolved_ext_id, price, qty, fee, is_maker);
             }
             BotEvent::PositionUpdate { market, size, entry_price, mark_price, .. } => {
@@ -298,6 +339,8 @@ impl MarketBot {
     }
 
     /// Cancel all live orders via mass cancel (single REST call).
+    /// P0-1 FIX: Wait for WebSocket confirmation before returning to prevent
+    /// placing new orders while old orders are still active on exchange.
     async fn cancel_all_live(&self, tick_time: Instant) {
         if self.state.smoke_mode { return; }
         let market = self.state.market();
@@ -313,6 +356,24 @@ impl MarketBot {
             Ok(_) => {
                 self.state.latency.record_cancel_rtt(t0.elapsed().as_micros() as u64);
                 self.state.latency.record_tick_to_cancel(tick_time.elapsed().as_micros() as u64);
+
+                // Wait up to 200ms for WS CANCELLED events to arrive and clear order tracker.
+                // This prevents placing new orders while old orders are still live on exchange.
+                let wait_start = Instant::now();
+                const MAX_WAIT_MS: u64 = 200;
+                while wait_start.elapsed().as_millis() < MAX_WAIT_MS as u128 {
+                    if self.state.order_tracker.live_count() == 0 {
+                        debug!(wait_ms = wait_start.elapsed().as_millis(), "Mass cancel confirmed via WS");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                if self.state.order_tracker.live_count() > 0 {
+                    warn!(
+                        remaining_orders = self.state.order_tracker.live_count(),
+                        "Mass cancel WS confirmation timeout — orders may still be live"
+                    );
+                }
             }
             Err(e) => {
                 debug!(error = %e, "Mass cancel failed");
@@ -371,12 +432,23 @@ impl MarketBot {
 
         // Calculate spread
         let vpin_mult = SpreadCalculator::vpin_multiplier(self.vpin_calc.vpin());
+
+        // Rolling realized volatility from recent trade prices (bps).
+        let volatility_bps = self.vol_estimator.volatility_bps();
+
+        // Latency-adjusted vol bump: widen spread when order RTT is elevated.
+        let latency_vol_bps = match self.state.latency.last_order_rtt_us() {
+            Some(rtt_us) if rtt_us > 500_000 => dec!(3.0), // >500ms
+            Some(rtt_us) if rtt_us > 200_000 => dec!(1.5), // >200ms
+            _ => Decimal::ZERO,
+        };
+
         let spread_input = SpreadInput {
-            volatility_bps: Decimal::ZERO,
+            volatility_bps,
             vpin_multiplier: vpin_mult,
             panic_spread_bps: Decimal::ZERO,
             inventory_ratio,
-            latency_vol_bps: Decimal::ZERO,
+            latency_vol_bps,
             // Negative markout → positive adjustment → widen spread
             markout_adj_bps: -self.state.markout.feedback_bps(self.state.market()),
             caf_multiplier: Decimal::ONE,
@@ -434,10 +506,21 @@ impl MarketBot {
 
     async fn apply_quotes(&mut self, market: &str, quotes: &GeneratedQuotes, tick_time: Instant) {
         // Cancels already fired in cancel_all_live() before quote pipeline.
-        // Build order requests synchronously (risk checks + signing prep)
+        // P0-3 FIX: Build order requests synchronously with cumulative exposure tracking
+        // to prevent race condition where multiple orders pass individual checks
+        // but together exceed limits.
         let mut order_reqs = Vec::new();
+        let mut batch_exposure_usd = Decimal::ZERO;
+
         for quote in quotes.bids.iter().map(|q| (Side::Buy, q)).chain(quotes.asks.iter().map(|q| (Side::Sell, q))) {
-            if let Some(req) = self.prepare_order(market, quote.0, quote.1.price, quote.1.size, quotes.reduce_only) {
+            if let Some(req) = self.prepare_order_with_batch_exposure(
+                market,
+                quote.0,
+                quote.1.price,
+                quote.1.size,
+                quotes.reduce_only,
+                &mut batch_exposure_usd,
+            ) {
                 order_reqs.push(req);
             }
         }
@@ -493,7 +576,17 @@ impl MarketBot {
 
     /// Prepare an order request synchronously (risk checks, signing params, tracker registration).
     /// Returns None if the order is blocked by risk limits.
-    fn prepare_order(&mut self, market: &str, side: Side, price: Decimal, qty: Decimal, reduce_only: bool) -> Option<OrderRequest> {
+    /// P0-3 FIX: Added batch_exposure_usd parameter to track cumulative exposure across
+    /// orders being prepared in the same batch, preventing race condition.
+    fn prepare_order_with_batch_exposure(
+        &mut self,
+        market: &str,
+        side: Side,
+        price: Decimal,
+        qty: Decimal,
+        reduce_only: bool,
+        batch_exposure_usd: &mut Decimal,
+    ) -> Option<OrderRequest> {
         // Risk limit checks: skip for reduce-only orders (they decrease exposure)
         if !reduce_only {
             let is_buy = side == Side::Buy;
@@ -516,19 +609,23 @@ impl MarketBot {
             let (bid_exp, ask_exp) = self.state.order_tracker.pending_exposure(market, mark);
             self.state.exposure_tracker.update_pending_orders(market, bid_exp, ask_exp);
 
-            // Check worst-case exposure (positions + all pending orders filled).
+            // Check worst-case exposure INCLUDING this order AND all previously prepared orders in this batch.
             let order_notional = qty * price;
             let worst_case = self.state.exposure_tracker.worst_case_exposure_usd();
-            if worst_case + order_notional > self.state.exposure_tracker.max_total_usd() {
+            if worst_case + *batch_exposure_usd + order_notional > self.state.exposure_tracker.max_total_usd() {
                 debug!(
                     side = %side,
                     order_usd = %order_notional,
+                    batch_usd = %batch_exposure_usd,
                     worst_case = %worst_case,
                     max = %self.state.exposure_tracker.max_total_usd(),
-                    "Order blocked: worst-case exposure limit reached"
+                    "Order blocked: worst-case exposure limit (with batch) reached"
                 );
                 return None;
             }
+
+            // Add this order's exposure to the running batch total
+            *batch_exposure_usd += order_notional;
         }
 
         self.order_seq += 1;
@@ -593,6 +690,12 @@ impl MarketBot {
                             self.state.market(), fill_price, is_buy, mid, bn_mid,
                         );
                     }
+                } else {
+                    warn!(
+                        external_id = %external_id,
+                        status = %status,
+                        "Markout skipped: FILLED order update missing avg_fill_price"
+                    );
                 }
             }
         }

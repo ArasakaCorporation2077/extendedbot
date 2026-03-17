@@ -138,7 +138,9 @@ pub struct PositionResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderResponse {
+    #[serde(deserialize_with = "deserialize_string_from_any")]
     pub id: String,
+    #[serde(alias = "externalId")]
     pub external_id: Option<String>,
     pub market: String,
     pub side: String,
@@ -153,7 +155,15 @@ pub struct OrderResponse {
     pub post_only: Option<bool>,
     pub reduce_only: Option<bool>,
     pub time_in_force: Option<String>,
+    #[serde(alias = "createdAt", alias = "createdTime")]
     pub created_at: Option<String>,
+    // Additional fields from actual API that we don't use
+    #[serde(default)]
+    pub average_price: Option<String>,
+    #[serde(default)]
+    pub payed_fee: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<u64>,
 }
 
 /// Fee info from GET /api/v1/user/fees.
@@ -206,6 +216,26 @@ where D: serde::Deserializer<'de>,
         fn visit_f64<E: de::Error>(self, v: f64) -> Result<u32, E> { Ok(v as u32) }
     }
     deserializer.deserialize_any(U32Visitor)
+}
+
+fn deserialize_string_from_any<'de, D>(deserializer: D) -> Result<String, D::Error>
+where D: serde::Deserializer<'de>,
+{
+    use serde::de;
+    struct StringVisitor;
+    impl<'de> de::Visitor<'de> for StringVisitor {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or number")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<String, E> { Ok(v.to_string()) }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<String, E> { Ok(v.to_string()) }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<String, E> { Ok(v.to_string()) }
+    }
+    deserializer.deserialize_any(StringVisitor)
 }
 
 /// Market stats from GET /api/v1/info/markets/{market}/stats.

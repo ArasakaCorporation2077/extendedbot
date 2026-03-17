@@ -175,6 +175,11 @@ impl ExtendedRestClient {
         if let Ok(wrapper) = serde_json::from_str::<ApiResponse<T>>(&text) {
             return Ok(wrapper.data);
         }
+
+        // Log raw response on parse failure for debugging
+        error!("Failed to parse response from {}", path);
+        error!("Raw response (first 500 chars): {}", &text.chars().take(500).collect::<String>());
+
         serde_json::from_str(&text).context(format!("Failed to parse response from {}", path))
     }
 
