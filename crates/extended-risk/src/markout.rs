@@ -241,10 +241,26 @@ impl MarkoutTracker {
         }
     }
 
-    /// Get the 5-second EWMA adjusted markout for spread feedback.
-    /// Uses Binance-adjusted markout to isolate execution quality from market drift.
+    /// Toxicity score in bps: max(0, -raw_500ms) + max(0, -adj_5s).
+    /// Short-term raw catches fast adverse selection.
+    /// Long-term adjusted catches sustained pure adverse selection (market drift removed).
+    /// Higher = more toxic = widen spread.
+    pub fn tox_score_bps(&self, market: &str) -> Option<f64> {
+        let raw_500 = self.ewma_raw_bps(market, 500);
+        let adj_5s = self.ewma_adj_bps(market, 5_000);
+
+        match (raw_500, adj_5s) {
+            (Some(r), Some(a)) => Some((-r).max(0.0) + (-a).max(0.0)),
+            (Some(r), None) => Some((-r).max(0.0)),
+            (None, Some(a)) => Some((-a).max(0.0)),
+            (None, None) => None,
+        }
+    }
+
+    /// Spread feedback in bps. Uses tox_score if available, falls back to 5s adj EWMA.
     pub fn feedback_bps(&self, market: &str) -> Decimal {
-        let bps = self.ewma_adj_bps(market, 5_000)
+        let bps = self.tox_score_bps(market)
+            .or_else(|| self.ewma_adj_bps(market, 5_000))
             .or_else(|| self.ewma_adj_bps(market, 1_000))
             .unwrap_or(0.0);
         Decimal::try_from(bps).unwrap_or(Decimal::ZERO)
@@ -276,10 +292,22 @@ impl MarkoutTracker {
                 }
             }
             if !parts.is_empty() {
+                // tox_score needs ewma lock released, so compute from the data we have
+                let tox = {
+                    let raw_500 = if m.ewma_initialized[2] { Some(m.ewma_raw_bps[2]) } else { None };
+                    let adj_5s = if m.ewma_initialized[4] { Some(m.ewma_adj_bps[4]) } else { None };
+                    match (raw_500, adj_5s) {
+                        (Some(r), Some(a)) => Some((-r).max(0.0) + (-a).max(0.0)),
+                        (Some(r), None) => Some((-r).max(0.0)),
+                        (None, Some(a)) => Some((-a).max(0.0)),
+                        (None, None) => None,
+                    }
+                };
+                let tox_str = tox.map(|t| format!(" | tox={:.2}bps", t)).unwrap_or_default();
                 info!(
                     market = %market,
                     pending = pending_count,
-                    "Markout: {}", parts.join(" | ")
+                    "Markout: {}{}", parts.join(" | "), tox_str
                 );
             }
         }
