@@ -94,9 +94,11 @@ impl ExtendedWebSocket {
             let connect_start = std::time::Instant::now();
             match self.connect_and_listen(&event_tx).await {
                 Ok(()) => {
-                    // Server sends "Session timeout" close — auto-reconnect
-                    info!(stream = ?self.stream, "WebSocket closed, reconnecting");
-                    backoff = Duration::from_secs(1);
+                    // Server sends "Session timeout" close — auto-reconnect with small delay
+                    // to avoid thundering herd when all 4 streams timeout simultaneously.
+                    info!(stream = ?self.stream, "WebSocket closed cleanly (session timeout), reconnecting in 2s");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    backoff = Duration::from_secs(2);
                     continue;
                 }
                 Err(e) => {
@@ -108,9 +110,10 @@ impl ExtendedWebSocket {
                         stream: format!("{:?}", self.stream),
                     });
 
-                    // Reset backoff if connection survived > 10s (was healthy)
+                    // Reset backoff if connection survived > 10s (was healthy),
+                    // but keep minimum at 2s to avoid thundering herd on 429 errors.
                     if connect_start.elapsed() > Duration::from_secs(10) {
-                        backoff = Duration::from_secs(1);
+                        backoff = Duration::from_secs(2);
                     }
 
                     warn!(backoff_ms = backoff.as_millis(), "Reconnecting after backoff");

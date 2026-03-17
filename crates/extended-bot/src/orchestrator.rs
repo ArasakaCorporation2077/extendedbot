@@ -432,6 +432,8 @@ async fn spawn_ws_connections(
             error!(error = %e, "Orderbook WS exited");
         }
     }));
+    // Stagger stream connections by 500ms to avoid thundering herd on reconnect
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Trades stream
     let ws_trades = ExtendedWebSocket::new(&config.exchange, WsStream::Trades(market.clone()));
@@ -441,6 +443,7 @@ async fn spawn_ws_connections(
             error!(error = %e, "Trades WS exited");
         }
     }));
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Mark price stream
     let ws_mark = ExtendedWebSocket::new(&config.exchange, WsStream::MarkPrice(market.clone()));
@@ -450,6 +453,7 @@ async fn spawn_ws_connections(
             error!(error = %e, "MarkPrice WS exited");
         }
     }));
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Private account stream
     if !config.exchange.api_key.is_empty() && !config.exchange.paper_trading {
