@@ -6,7 +6,7 @@ use std::collections::HashMap;
 /// Tracks aggregate exposure across all markets and enforces global limits.
 pub struct ExposureTracker {
     inner: RwLock<ExposureInner>,
-    max_total_usd: Decimal,
+    max_total_usd: RwLock<Decimal>,
 }
 
 struct ExposureInner {
@@ -26,8 +26,12 @@ impl ExposureTracker {
             inner: RwLock::new(ExposureInner {
                 markets: HashMap::new(),
             }),
-            max_total_usd,
+            max_total_usd: RwLock::new(max_total_usd),
         }
+    }
+
+    pub fn set_max_total_usd(&self, max: Decimal) {
+        *self.max_total_usd.write() = max;
     }
 
     pub fn update_position(&self, market: &str, position_usd: Decimal) {
@@ -62,15 +66,17 @@ impl ExposureTracker {
     }
 
     pub fn can_add_exposure(&self, additional_usd: Decimal) -> bool {
-        self.gross_exposure_usd() + additional_usd <= self.max_total_usd
+        let max = *self.max_total_usd.read();
+        self.gross_exposure_usd() + additional_usd <= max
     }
 
     pub fn max_total_usd(&self) -> Decimal {
-        self.max_total_usd
+        *self.max_total_usd.read()
     }
 
     pub fn remaining_capacity_usd(&self) -> Decimal {
-        (self.max_total_usd - self.gross_exposure_usd()).max(Decimal::ZERO)
+        let max = *self.max_total_usd.read();
+        (max - self.gross_exposure_usd()).max(Decimal::ZERO)
     }
 }
 

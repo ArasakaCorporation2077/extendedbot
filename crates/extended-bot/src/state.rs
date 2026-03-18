@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use tokio::sync::{mpsc, watch};
 
 use extended_exchange::adapter::ExchangeAdapter;
@@ -45,6 +46,8 @@ pub struct BotState {
     pub tick_size: RwLock<Decimal>,
     /// Market size step from exchange metadata.
     pub size_step: RwLock<Decimal>,
+    /// Latest total equity from BalanceUpdate events. Zero until first update.
+    pub equity: RwLock<Decimal>,
 }
 
 impl BotState {
@@ -81,6 +84,7 @@ impl BotState {
             binance_mid: RwLock::new(None),
             tick_size: RwLock::new(rust_decimal_macros::dec!(0.1)),
             size_step: RwLock::new(rust_decimal_macros::dec!(0.001)),
+            equity: RwLock::new(Decimal::ZERO),
             adapter,
             config,
             smoke_mode,
@@ -94,5 +98,31 @@ impl BotState {
     /// Take the event receiver (can only be called once).
     pub fn take_event_rx(&self) -> Option<mpsc::UnboundedReceiver<BotEvent>> {
         self.event_rx.lock().take()
+    }
+
+    /// Effective order size in USD, dynamically sized to 40% of current equity.
+    /// Falls back to config value when equity is unknown.
+    /// Clamped between config min_order_usd and max_order_usd.
+    pub fn effective_order_size_usd(&self) -> Decimal {
+        let equity = *self.equity.read();
+        if equity.is_zero() {
+            return self.config.trading.order_size_usd;
+        }
+        let dynamic = equity * dec!(0.4);
+        dynamic
+            .max(self.config.trading.min_order_usd)
+            .min(self.config.trading.max_order_usd)
+    }
+
+    /// Effective max position in USD, dynamically sized to 2.5x current equity.
+    /// Falls back to config value when equity is unknown.
+    /// Capped at config max_position_usd.
+    pub fn effective_max_position_usd(&self) -> Decimal {
+        let equity = *self.equity.read();
+        if equity.is_zero() {
+            return self.config.risk.max_position_usd;
+        }
+        let dynamic = equity * dec!(2.5);
+        dynamic.min(self.config.risk.max_position_usd)
     }
 }

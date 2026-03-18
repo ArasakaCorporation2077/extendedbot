@@ -6,7 +6,7 @@ use std::collections::HashMap;
 /// Per-market position tracking with PnL calculation.
 pub struct PositionManager {
     positions: RwLock<HashMap<String, CoinPosition>>,
-    max_total_position_usd: Decimal,
+    max_total_position_usd: RwLock<Decimal>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,7 +115,16 @@ impl PositionManager {
     pub fn new(max_total_position_usd: Decimal) -> Self {
         Self {
             positions: RwLock::new(HashMap::new()),
-            max_total_position_usd,
+            max_total_position_usd: RwLock::new(max_total_position_usd),
+        }
+    }
+
+    /// Update the maximum position limit and propagate to all tracked markets.
+    pub fn set_max_position_usd(&self, max: Decimal) {
+        *self.max_total_position_usd.write() = max;
+        let mut positions = self.positions.write();
+        for pos in positions.values_mut() {
+            pos.max_position_usd = max;
         }
     }
 
@@ -140,7 +149,7 @@ impl PositionManager {
     }
 
     pub fn is_within_limits(&self) -> bool {
-        self.total_exposure_usd() < self.max_total_position_usd
+        self.total_exposure_usd() < *self.max_total_position_usd.read()
     }
 
     pub fn on_fill(&self, symbol: &str, size: Decimal, price: Decimal, is_buy: bool) -> Decimal {

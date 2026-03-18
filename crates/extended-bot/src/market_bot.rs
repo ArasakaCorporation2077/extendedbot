@@ -239,7 +239,18 @@ impl MarketBot {
                 self.state.exposure_tracker.update_position(&market, notional * size.signum());
             }
             BotEvent::BalanceUpdate { available, total_equity, .. } => {
-                debug!(available = %available, equity = %total_equity, "Balance update");
+                *self.state.equity.write() = total_equity;
+                // Propagate dynamic limits to risk components.
+                let max_pos = self.state.effective_max_position_usd();
+                self.state.exposure_tracker.set_max_total_usd(max_pos);
+                self.state.position_manager.set_max_position_usd(max_pos);
+                info!(
+                    available = %available,
+                    equity = %total_equity,
+                    order_size = %self.state.effective_order_size_usd(),
+                    max_position = %max_pos,
+                    "Dynamic sizing updated"
+                );
             }
             BotEvent::CircuitBreakerTrip { reason } => {
                 warn!(reason = %reason, "Circuit breaker tripped from event");
@@ -516,10 +527,10 @@ impl MarketBot {
         let exchange_best_bid = self.state.orderbook.best_bid().map(|l| l.price);
         let exchange_best_ask = self.state.orderbook.best_ask().map(|l| l.price);
 
-        // Compute base size
+        // Compute base size dynamically from current equity
         let mark = self.state.mark_price.read().unwrap_or(fair_price);
         let base_size = if mark > Decimal::ZERO {
-            self.state.config.trading.order_size_usd / mark
+            self.state.effective_order_size_usd() / mark
         } else {
             dec!(0.001)
         };
