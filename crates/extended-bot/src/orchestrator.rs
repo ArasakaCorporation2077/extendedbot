@@ -227,9 +227,9 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
     // 5. Spawn WS connections (always — paper mode needs live market data for check_fills)
     let ws_handles = spawn_ws_connections(&config, state.event_tx.clone()).await;
 
-    // 5b. Spawn Binance reference price feed with auto-reconnection
-    // P0-2 FIX: BinanceWs::run() already has infinite reconnection loop,
-    // but we wrap it in another loop to handle panics and ensure it never dies.
+    // 5b. Spawn Binance reference price feeds with auto-reconnection.
+    // BinanceWs::run() / run_agg_trade() already loop on reconnect; we wrap
+    // in an outer loop to survive any unexpected Ok() returns or panics.
     {
         let binance_ws = extended_exchange::BinanceWs::from_market(state.market());
         let tx = state.event_tx.clone();
@@ -237,16 +237,34 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
             loop {
                 match binance_ws.run(tx.clone()).await {
                     Ok(()) => {
-                        error!("Binance WS run() returned Ok (should never happen), restarting...");
+                        error!("Binance bookTicker run() returned Ok (should never happen), restarting...");
                     }
                     Err(e) => {
-                        error!(error = %e, "Binance WS run() exited with error, restarting in 5s...");
+                        error!(error = %e, "Binance bookTicker run() exited with error, restarting in 5s...");
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
         info!("Binance bookTicker feed spawned with auto-restart wrapper");
+    }
+    {
+        let binance_agg = extended_exchange::BinanceWs::from_market(state.market());
+        let tx = state.event_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match binance_agg.run_agg_trade(tx.clone()).await {
+                    Ok(()) => {
+                        error!("Binance aggTrade run_agg_trade() returned Ok (should never happen), restarting...");
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Binance aggTrade run_agg_trade() exited with error, restarting in 5s...");
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        info!("Binance aggTrade feed spawned with auto-restart wrapper");
     }
 
     // 6. Activate dead man's switch (live only, not smoke)

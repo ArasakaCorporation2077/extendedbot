@@ -14,6 +14,7 @@ use extended_strategy::fair_price::FairPriceCalculator;
 use extended_strategy::quote_generator::{ActiveSide, GeneratedQuotes, QuoteGenerator, QuoteInput};
 use extended_strategy::skew::SkewCalculator;
 use extended_strategy::spread::{SpreadCalculator, SpreadInput};
+use extended_strategy::trade_flow::TradeFlowTracker;
 use extended_strategy::vpin::VpinCalculator;
 use extended_types::events::BotEvent;
 use extended_types::market_data::L2Level;
@@ -77,6 +78,7 @@ pub struct MarketBot {
     quote_gen: QuoteGenerator,
     vpin_calc: VpinCalculator,
     vol_estimator: VolatilityEstimator,
+    trade_flow: TradeFlowTracker,
     fast_cancel: FastCancel,
     last_requote: Instant,
     last_fast_cancel: Option<Instant>,
@@ -131,6 +133,8 @@ impl MarketBot {
             tc.vpin_num_buckets,
         );
 
+        let trade_flow = TradeFlowTracker::new(tc.trade_flow_window_s);
+
         let fast_cancel = FastCancel::new(
             Decimal::try_from(tc.fast_cancel_threshold_bps).unwrap_or(dec!(3.0)),
             tc.max_order_age_s,
@@ -144,6 +148,7 @@ impl MarketBot {
             quote_gen,
             vpin_calc,
             vol_estimator: VolatilityEstimator::new(50),
+            trade_flow,
             fast_cancel,
             last_requote: Instant::now(),
             last_fast_cancel: None,
@@ -187,6 +192,9 @@ impl MarketBot {
                 self.fair_price_calc.update_reference_mid(binance_mid);
                 // Cancel is handled by on_orderbook_update when x10 tick arrives.
                 // No cancel here — avoids cancel storm from high-freq Binance ticks.
+            }
+            BotEvent::BinanceTrade { qty, is_buyer_maker, received_at, .. } => {
+                self.trade_flow.on_trade(qty, is_buyer_maker, received_at);
             }
             BotEvent::FundingRate { .. } => {
                 // Informational only for now
@@ -350,11 +358,20 @@ impl MarketBot {
 
         if should_requote {
             // quote_price = fair_price + basis_offset (lands on x10 orderbook)
-            let quote_price = self.fair_price_calc.quote_price().unwrap_or(fp);
+            // + trade_flow shift (positive = buy pressure → raise fair price)
+            let tc = &self.state.config.trading;
+            let flow_sensitivity = Decimal::try_from(tc.trade_flow_sensitivity_bps).unwrap_or(dec!(1.0));
+            let flow_imbalance = self.trade_flow.imbalance();
+            let flow_shift_bps = flow_imbalance * flow_sensitivity;
+            let flow_shift_price = TradeFlowTracker::bps_to_price_shift(flow_shift_bps, fp);
+            let base_quote_price = self.fair_price_calc.quote_price().unwrap_or(fp);
+            let quote_price = base_quote_price + flow_shift_price;
             info!(
                 fair_price = %fp,
                 quote_price = %quote_price,
                 basis_offset = %self.fair_price_calc.basis_offset(),
+                flow_shift_bps = %flow_shift_bps,
+                flow_imbalance = %flow_imbalance,
                 mid = %mid,
                 change_bps = %price_change,
                 has_orders = has_live_orders,

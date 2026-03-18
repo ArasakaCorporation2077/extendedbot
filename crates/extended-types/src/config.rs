@@ -136,6 +136,14 @@ pub struct TradingConfig {
     pub one_side_inventory_ratio: f64,
     #[serde(default = "default_hard_one_side_ratio")]
     pub hard_one_side_inventory_ratio: f64,
+
+    // Trade flow imbalance signal
+    /// Rolling window length in seconds for buy/sell volume imbalance (default 5.0).
+    #[serde(default = "default_trade_flow_window")]
+    pub trade_flow_window_s: f64,
+    /// Sensitivity: max fair-price shift in bps when imbalance = 1.0 (default 1.0).
+    #[serde(default = "default_trade_flow_sensitivity")]
+    pub trade_flow_sensitivity_bps: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -188,6 +196,8 @@ fn default_close_threshold() -> f64 { 0.25 }
 fn default_close_spread() -> f64 { 4.0 }
 fn default_one_side_ratio() -> f64 { 0.45 }
 fn default_hard_one_side_ratio() -> f64 { 0.70 }
+fn default_trade_flow_window() -> f64 { 5.0 }
+fn default_trade_flow_sensitivity() -> f64 { 1.0 }
 fn default_max_daily_loss() -> Decimal { Decimal::new(500, 0) }
 fn default_max_orders_per_min() -> u32 { 200 }
 fn default_max_errors_per_min() -> u32 { 10 }

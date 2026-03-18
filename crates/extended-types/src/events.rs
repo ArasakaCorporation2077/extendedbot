@@ -72,6 +72,13 @@ pub enum BotEvent {
         ask: Decimal,
         received_at: Instant,
     },
+    BinanceTrade {
+        price: Decimal,
+        qty: Decimal,
+        /// true = seller is the aggressor (taker sell), false = buyer is the aggressor (taker buy)
+        is_buyer_maker: bool,
+        received_at: Instant,
+    },
 
     // -- Internal signals --
     CircuitBreakerTrip {

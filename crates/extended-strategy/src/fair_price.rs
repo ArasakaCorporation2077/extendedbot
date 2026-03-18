@@ -98,6 +98,14 @@ impl FairPriceCalculator {
         self.fair_price.map(|fp| fp + self.basis_offset())
     }
 
+    /// Apply a trade-flow shift (in absolute price units) on top of quote_price.
+    ///
+    /// shift_price = fair_price × shift_bps / 10_000
+    /// Positive shift → buy pressure → raise fair price.
+    pub fn apply_flow_shift(&self, shift_price: Decimal) -> Option<Decimal> {
+        self.quote_price().map(|qp| qp + shift_price)
+    }
+
     pub fn last_update(&self) -> Option<Instant> {
         self.last_update
     }
