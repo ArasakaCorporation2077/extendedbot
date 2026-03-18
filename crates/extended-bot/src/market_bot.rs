@@ -750,9 +750,10 @@ impl MarketBot {
                 if let Some(fill_price) = avg_fill_price {
                     if let Some(mid) = self.state.orderbook.mid() {
                         let is_buy = tracked.side == extended_types::order::Side::Buy;
+                        let side_str = if is_buy { "buy" } else { "sell" };
                         let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
                         self.state.markout.record_fill(
-                            self.state.market(), fill_price, is_buy, mid, bn_mid,
+                            self.state.market(), &external_id, side_str, fill_price, is_buy, mid, bn_mid,
                         );
                     }
                 } else {

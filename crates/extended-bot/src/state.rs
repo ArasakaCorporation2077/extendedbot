@@ -70,7 +70,7 @@ impl BotState {
             position_manager: PositionManager::new(config.risk.max_position_usd),
             exposure_tracker: ExposureTracker::new(config.risk.max_position_usd),
             circuit_breaker: CircuitBreaker::new(cb_config),
-            markout: MarkoutTracker::new(500, 0.2),
+            markout: MarkoutTracker::new(500, 0.2, Some(std::path::PathBuf::from("markouts.jsonl"))),
             latency: LatencyTracker::new(),
             event_tx,
             event_rx: parking_lot::Mutex::new(Some(event_rx)),

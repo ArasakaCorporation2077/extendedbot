@@ -8,6 +8,7 @@
 //!   negative = adverse selection (price moved against us)
 
 use std::collections::{HashMap, VecDeque};
+use std::io::Write;
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -27,11 +28,15 @@ fn horizon_index(horizon_ms: u64) -> Option<usize> {
 /// A fill awaiting markout evaluation at future time horizons.
 struct PendingFill {
     market: String,
+    external_id: String,
+    side: String,
     fill_price: Decimal,
     is_buy: bool,
     mid_at_fill: Decimal,
     binance_mid_at_fill: Decimal,
     filled_at: Instant,
+    /// Unix timestamp in ms at the moment the fill was recorded (for JSONL logging).
+    filled_at_ms: i64,
     evaluated: [bool; 5],
 }
 
@@ -69,15 +74,28 @@ pub struct MarkoutTracker {
     markets: Mutex<HashMap<String, MarketMarkout>>,
     max_history: usize,
     ewma_alpha: f64,
+    log_path: Option<std::path::PathBuf>,
+    log_file: Mutex<Option<std::fs::File>>,
 }
 
 impl MarkoutTracker {
-    pub fn new(max_history: usize, ewma_alpha: f64) -> Self {
+    pub fn new(max_history: usize, ewma_alpha: f64, log_path: Option<std::path::PathBuf>) -> Self {
+        let log_file = log_path.as_ref().and_then(|p| {
+            match std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    warn!(path = %p.display(), error = %e, "Failed to open markouts.jsonl for writing");
+                    None
+                }
+            }
+        });
         Self {
             pending: Mutex::new(VecDeque::new()),
             markets: Mutex::new(HashMap::new()),
             max_history,
             ewma_alpha,
+            log_path,
+            log_file: Mutex::new(log_file),
         }
     }
 
@@ -86,6 +104,8 @@ impl MarkoutTracker {
     pub fn record_fill(
         &self,
         market: &str,
+        external_id: &str,
+        side: &str,
         fill_price: Decimal,
         is_buy: bool,
         current_mid: Decimal,
@@ -98,11 +118,14 @@ impl MarkoutTracker {
 
         self.pending.lock().push_back(PendingFill {
             market: market.to_string(),
+            external_id: external_id.to_string(),
+            side: side.to_string(),
             fill_price,
             is_buy,
             mid_at_fill: current_mid,
             binance_mid_at_fill: binance_mid,
             filled_at: Instant::now(),
+            filled_at_ms: chrono::Utc::now().timestamp_millis(),
             evaluated: [false; 5],
         });
     }
@@ -182,6 +205,30 @@ impl MarkoutTracker {
                 }
 
                 fill.evaluated[h_idx] = true;
+
+                // Write JSONL log entry
+                {
+                    let line = serde_json::json!({
+                        "ts_ms": fill.filled_at_ms,
+                        "market": fill.market,
+                        "external_id": fill.external_id,
+                        "side": fill.side,
+                        "fill_price": fill.fill_price.to_string(),
+                        "mid_at_fill": fill.mid_at_fill.to_string(),
+                        "binance_mid_at_fill": fill.binance_mid_at_fill.to_string(),
+                        "horizon_ms": horizon_ms,
+                        "raw_bps": raw_bps,
+                        "adj_bps": adjusted_bps,
+                        "ewma_raw_bps": market_data.ewma_raw_bps[h_idx],
+                        "ewma_adj_bps": market_data.ewma_adj_bps[h_idx],
+                    });
+                    let mut log = self.log_file.lock();
+                    if let Some(f) = log.as_mut() {
+                        if let Err(e) = writeln!(f, "{}", line) {
+                            warn!(error = %e, "Failed to write markout log line");
+                        }
+                    }
+                }
 
                 debug!(
                     market = %fill.market,
@@ -328,17 +375,17 @@ mod tests {
 
     #[test]
     fn test_markout_buy_favorable() {
-        let tracker = MarkoutTracker::new(100, 0.2);
+        let tracker = MarkoutTracker::new(100, 0.2, None);
         // Buy at 100, mid was 100
-        tracker.record_fill("BTC-USD", dec!(100), true, dec!(100), dec!(100));
+        tracker.record_fill("BTC-USD", "emm-1", "buy", dec!(100), true, dec!(100), dec!(100));
         assert_eq!(tracker.pending_count(), 1);
     }
 
     #[test]
     fn test_markout_no_mid() {
-        let tracker = MarkoutTracker::new(100, 0.2);
+        let tracker = MarkoutTracker::new(100, 0.2, None);
         // Should skip when mid is zero
-        tracker.record_fill("BTC-USD", dec!(100), true, Decimal::ZERO, dec!(100));
+        tracker.record_fill("BTC-USD", "emm-1", "buy", dec!(100), true, Decimal::ZERO, dec!(100));
         assert_eq!(tracker.pending_count(), 0);
     }
 
@@ -351,7 +398,7 @@ mod tests {
 
     #[test]
     fn test_feedback_default() {
-        let tracker = MarkoutTracker::new(100, 0.2);
+        let tracker = MarkoutTracker::new(100, 0.2, None);
         assert_eq!(tracker.feedback_bps("BTC-USD"), Decimal::ZERO);
     }
 }
