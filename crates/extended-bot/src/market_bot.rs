@@ -493,8 +493,8 @@ impl MarketBot {
             panic_spread_bps: Decimal::ZERO,
             inventory_ratio,
             latency_vol_bps,
-            // Negative markout → positive adjustment → widen spread
-            markout_adj_bps: -self.state.markout.feedback_bps(self.state.market()),
+            // tox_score is positive when adverse → directly widens spread
+            markout_adj_bps: self.state.markout.feedback_bps(self.state.market()),
             caf_multiplier: Decimal::ONE,
         };
         let spread = self.spread_calc.calculate(&spread_input);
