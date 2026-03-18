@@ -305,12 +305,13 @@ impl MarkoutTracker {
     }
 
     /// Spread feedback in bps. Uses tox_score if available, falls back to 5s adj EWMA.
+    /// Always >= 0: only widens spread, never narrows.
     pub fn feedback_bps(&self, market: &str) -> Decimal {
         let bps = self.tox_score_bps(market)
-            .or_else(|| self.ewma_adj_bps(market, 5_000))
-            .or_else(|| self.ewma_adj_bps(market, 1_000))
+            .or_else(|| self.ewma_adj_bps(market, 5_000).map(|v| (-v).max(0.0)))
+            .or_else(|| self.ewma_adj_bps(market, 1_000).map(|v| (-v).max(0.0)))
             .unwrap_or(0.0);
-        Decimal::try_from(bps).unwrap_or(Decimal::ZERO)
+        Decimal::try_from(bps.max(0.0)).unwrap_or(Decimal::ZERO)
     }
 
     /// Number of fills pending evaluation.

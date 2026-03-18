@@ -170,7 +170,7 @@ impl MarketBot {
                 if market == self.state.market() {
                     for trade in &trades {
                         self.vpin_calc.on_trade(trade.size, !trade.is_buyer_maker);
-                        self.vol_estimator.on_trade(trade.price);
+                        // Vol estimator fed by Binance BBO only — don't mix x10 trades
                     }
                 }
             }
