@@ -147,7 +147,7 @@ impl MarketBot {
             skew_calc,
             quote_gen,
             vpin_calc,
-            vol_estimator: VolatilityEstimator::new(50),
+            vol_estimator: VolatilityEstimator::new(500), // ~10-15s of Binance BBO ticks
             trade_flow,
             fast_cancel,
             last_requote: Instant::now(),
@@ -190,6 +190,8 @@ impl MarketBot {
                 let binance_mid = (bid + ask) / dec!(2);
                 *self.state.binance_mid.write() = Some(binance_mid);
                 self.fair_price_calc.update_reference_mid(binance_mid);
+                // Feed Binance mid to vol estimator — much faster updates than x10 trades
+                self.vol_estimator.on_trade(binance_mid);
                 // Cancel is handled by on_orderbook_update when x10 tick arrives.
                 // No cancel here — avoids cancel storm from high-freq Binance ticks.
             }
