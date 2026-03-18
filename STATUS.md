@@ -261,6 +261,33 @@ skew = price_skew_bps × inventory_ratio² × fair_price
 
 ---
 
+## 핵심 버그 기록 (실제 손실 유발)
+
+### BUG-001: Exposure tracker 방향성 미고려 — 포지션 쌓임 반복 (2026-03-18)
+**커밋**: `110881b`, `77b5cac`
+**증상**: LONG $400 쌓이면 ASK(SELL) 주문까지 차단됨. 포지션 줄이는 주문이 막혀 계속 쌓임. SHORT도 동일.
+**원인**: `prepare_order_with_batch_exposure()`에서 BUY/SELL 구분 없이 `worst_case + order_notional > max` 체크.
+**수정**: net_position 방향 기준으로 같은 방향 주문만 `batch_contribution`에 누적.
+**손실**: 반복적 포지션 쏠림 → 수동 `--close` 필요, 약 $26 손실.
+
+### BUG-002: tox_score 부호 반전 — 역선택 심할수록 spread 좁아짐 (2026-03-18)
+**커밋**: `0cae294`
+**증상**: adverse selection 심해질수록 spread가 넓어져야 하는데 반대로 좁아짐.
+**원인**: tox_score 부호 반전 → feedback이 spread를 오히려 줄이는 방향으로 작용.
+**영향**: 봇 가동 내내 역선택 상황에서 손실 가속.
+
+### BUG-003: Startup flatten 가격 precision 오류 (2026-03-18)
+**증상**: 재시작 시 auto-flatten에서 "Invalid price precision (1125)" 에러 → 청산 실패.
+**원인**: `round_dp(1)` → tick_size=1 시장에서 소수점 가격 생성.
+**수정**: `round_dp(0)`.
+
+### BUG-004: markout 데이터 파일 미기록 (2026-03-18)
+**커밋**: `f1a2ca8`
+**증상**: markout 계산이 메모리에서만 이루어지고 재시작 시 전부 소실.
+**수정**: `markouts.jsonl` 추가. horizon별 평가 시점마다 한 줄씩 기록.
+
+---
+
 ## 발견된 이슈 & 해결 기록
 
 ### Binance Weighted Blend → 포지션 손실 (2026-03-18)
