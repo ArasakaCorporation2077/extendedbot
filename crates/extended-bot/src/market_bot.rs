@@ -181,14 +181,15 @@ impl MarketBot {
                 }
             }
             BotEvent::BinanceBbo { bid, ask, received_at } => {
+                let queue_delay_us = received_at.elapsed().as_micros();
+                if queue_delay_us > 5000 {
+                    debug!(queue_delay_us, "Binance BBO event queue delay >5ms");
+                }
                 self.last_binance_tick = Some(received_at);
                 let binance_mid = (bid + ask) / dec!(2);
                 *self.state.binance_mid.write() = Some(binance_mid);
                 self.fair_price_calc.update_reference_mid(binance_mid);
-                // Feed Binance mid to vol estimator — much faster updates than x10 trades
                 self.vol_estimator.on_trade(binance_mid);
-                // Cancel is handled by on_orderbook_update when x10 tick arrives.
-                // No cancel here — avoids cancel storm from high-freq Binance ticks.
             }
             BotEvent::BinanceTrade { qty, is_buyer_maker, received_at, .. } => {
                 // VPIN from Binance trades — much faster signal than x10
@@ -289,9 +290,11 @@ impl MarketBot {
     }
 
     async fn on_orderbook_update(&mut self, bids: Vec<L2Level>, asks: Vec<L2Level>, is_snapshot: bool, _ts: u64) {
+        let t0 = Instant::now(); // event handler entry
         let tick_time = self.last_binance_tick
             .filter(|t| t.elapsed() < Duration::from_millis(200))
             .unwrap_or_else(Instant::now);
+        let binance_age_us = tick_time.elapsed().as_micros();
 
         // === HOT PATH: orderbook → fair price → cancel. Minimum compute before cancel. ===
         if is_snapshot {
@@ -309,6 +312,7 @@ impl MarketBot {
             Some(fp) => fp,
             None => return,
         };
+        let compute_us = t0.elapsed().as_micros();
 
         let min_interval = Duration::from_millis(self.state.config.trading.min_requote_interval_ms);
         let threshold = Decimal::try_from(self.state.config.trading.update_threshold_bps).unwrap_or(dec!(3.0));
@@ -332,7 +336,17 @@ impl MarketBot {
 
         // Cancel IMMEDIATELY — before any non-critical computation
         if should_requote && has_live_orders {
+            let pre_cancel = t0.elapsed().as_micros();
             self.cancel_all_live(tick_time).await;
+            let post_cancel = t0.elapsed().as_micros();
+            debug!(
+                binance_age_us = binance_age_us as u64,
+                compute_us = compute_us as u64,
+                pre_cancel_us = pre_cancel as u64,
+                cancel_us = (post_cancel - pre_cancel) as u64,
+                total_us = post_cancel as u64,
+                "Latency breakdown: binance_tick_age → compute → cancel"
+            );
         } else if has_live_orders {
             self.check_fast_cancel(fp, tick_time).await;
         }
@@ -366,6 +380,7 @@ impl MarketBot {
             let flow_shift_price = TradeFlowTracker::bps_to_price_shift(flow_shift_bps, fp);
             let base_quote_price = self.fair_price_calc.quote_price().unwrap_or(fp);
             let quote_price = base_quote_price + flow_shift_price;
+            let pre_requote_us = t0.elapsed().as_micros();
             info!(
                 fair_price = %fp,
                 quote_price = %quote_price,
@@ -375,9 +390,13 @@ impl MarketBot {
                 mid = %mid,
                 change_bps = %price_change,
                 has_orders = has_live_orders,
+                binance_age_us = binance_age_us as u64,
+                pre_requote_us = pre_requote_us as u64,
                 "Requoting"
             );
             self.requote(quote_price, tick_time).await;
+            let total_us = t0.elapsed().as_micros();
+            debug!(total_cycle_us = total_us as u64, "Full requote cycle");
         }
     }
 
