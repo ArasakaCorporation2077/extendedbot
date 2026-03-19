@@ -144,6 +144,11 @@ pub struct TradingConfig {
     /// Sensitivity: max fair-price shift in bps when imbalance = 1.0 (default 1.0).
     #[serde(default = "default_trade_flow_sensitivity")]
     pub trade_flow_sensitivity_bps: f64,
+
+    // Depth imbalance signal
+    /// Max fair-price shift in bps when depth imbalance = 1.0 (default 1.5).
+    #[serde(default = "default_depth_imbalance_sensitivity")]
+    pub depth_imbalance_sensitivity_bps: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -198,6 +203,7 @@ fn default_one_side_ratio() -> f64 { 0.45 }
 fn default_hard_one_side_ratio() -> f64 { 0.70 }
 fn default_trade_flow_window() -> f64 { 5.0 }
 fn default_trade_flow_sensitivity() -> f64 { 1.0 }
+fn default_depth_imbalance_sensitivity() -> f64 { 1.5 }
 fn default_max_daily_loss() -> Decimal { Decimal::new(500, 0) }
 fn default_max_orders_per_min() -> u32 { 200 }
 fn default_max_errors_per_min() -> u32 { 10 }

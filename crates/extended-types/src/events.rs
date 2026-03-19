@@ -79,6 +79,13 @@ pub enum BotEvent {
         is_buyer_maker: bool,
         received_at: Instant,
     },
+    BinanceDepth {
+        /// Sum of all bid quantities across top 20 levels.
+        bid_volume: Decimal,
+        /// Sum of all ask quantities across top 20 levels.
+        ask_volume: Decimal,
+        received_at: Instant,
+    },
 
     // -- Internal signals --
     CircuitBreakerTrip {

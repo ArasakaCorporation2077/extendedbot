@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use extended_risk::fast_cancel::{FastCancel, LiveOrderInfo};
+use extended_strategy::depth_imbalance::DepthImbalanceTracker;
 use extended_strategy::fair_price::FairPriceCalculator;
 use extended_strategy::quote_generator::{ActiveSide, GeneratedQuotes, QuoteGenerator, QuoteInput};
 use extended_strategy::skew::SkewCalculator;
@@ -79,6 +80,7 @@ pub struct MarketBot {
     vpin_calc: VpinCalculator,
     vol_estimator: VolatilityEstimator,
     trade_flow: TradeFlowTracker,
+    depth_imbalance: DepthImbalanceTracker,
     fast_cancel: FastCancel,
     last_requote: Instant,
     last_fast_cancel: Option<Instant>,
@@ -135,6 +137,8 @@ impl MarketBot {
 
         let trade_flow = TradeFlowTracker::new(tc.trade_flow_window_s);
 
+        let depth_imbalance = DepthImbalanceTracker::new(0.3);
+
         let fast_cancel = FastCancel::new(
             Decimal::try_from(tc.fast_cancel_threshold_bps).unwrap_or(dec!(3.0)),
             tc.max_order_age_s,
@@ -149,6 +153,7 @@ impl MarketBot {
             vpin_calc,
             vol_estimator: VolatilityEstimator::new(500), // ~10-15s of Binance BBO ticks
             trade_flow,
+            depth_imbalance,
             fast_cancel,
             last_requote: Instant::now(),
             last_fast_cancel: None,
@@ -196,6 +201,13 @@ impl MarketBot {
                 // is_buyer_maker=true → seller is aggressor → !is_buyer_maker = is_buy
                 self.vpin_calc.on_trade(qty, !is_buyer_maker);
                 self.trade_flow.on_trade(qty, is_buyer_maker, received_at);
+            }
+            BotEvent::BinanceDepth { bid_volume, ask_volume, received_at } => {
+                let queue_delay_us = received_at.elapsed().as_micros();
+                if queue_delay_us > 10_000 {
+                    debug!(queue_delay_us, "Binance depth event queue delay >10ms");
+                }
+                self.depth_imbalance.on_depth(bid_volume, ask_volume);
             }
             BotEvent::FundingRate { .. } => {
                 // Informational only for now
@@ -373,13 +385,16 @@ impl MarketBot {
         if should_requote {
             // quote_price = fair_price + basis_offset (lands on x10 orderbook)
             // + trade_flow shift (positive = buy pressure → raise fair price)
+            // + depth imbalance shift (leading signal from resting book pressure)
             let tc = &self.state.config.trading;
             let flow_sensitivity = Decimal::try_from(tc.trade_flow_sensitivity_bps).unwrap_or(dec!(1.0));
             let flow_imbalance = self.trade_flow.imbalance();
             let flow_shift_bps = flow_imbalance * flow_sensitivity;
             let flow_shift_price = TradeFlowTracker::bps_to_price_shift(flow_shift_bps, fp);
+            let depth_shift_bps = self.depth_imbalance.shift_bps(tc.depth_imbalance_sensitivity_bps);
+            let depth_shift_price = TradeFlowTracker::bps_to_price_shift(depth_shift_bps, fp);
             let base_quote_price = self.fair_price_calc.quote_price().unwrap_or(fp);
-            let quote_price = base_quote_price + flow_shift_price;
+            let quote_price = base_quote_price + flow_shift_price + depth_shift_price;
             let pre_requote_us = t0.elapsed().as_micros();
             info!(
                 fair_price = %fp,
@@ -387,6 +402,8 @@ impl MarketBot {
                 basis_offset = %self.fair_price_calc.basis_offset(),
                 flow_shift_bps = %flow_shift_bps,
                 flow_imbalance = %flow_imbalance,
+                depth_shift_bps = %depth_shift_bps,
+                depth_imbalance = %self.depth_imbalance.imbalance(),
                 mid = %mid,
                 change_bps = %price_change,
                 has_orders = has_live_orders,

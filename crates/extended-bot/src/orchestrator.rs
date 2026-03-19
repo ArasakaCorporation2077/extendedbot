@@ -266,6 +266,24 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
         });
         info!("Binance aggTrade feed spawned with auto-restart wrapper");
     }
+    {
+        let binance_depth = extended_exchange::BinanceWs::from_market(state.market());
+        let tx = state.event_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match binance_depth.run_depth(tx.clone()).await {
+                    Ok(()) => {
+                        error!("Binance depth20 run_depth() returned Ok (should never happen), restarting...");
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Binance depth20 run_depth() exited with error, restarting in 5s...");
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        info!("Binance depth20 feed spawned with auto-restart wrapper");
+    }
 
     // 6. Activate dead man's switch (live only, not smoke)
     if !config.exchange.paper_trading && !smoke_mode {

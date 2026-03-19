@@ -27,6 +27,14 @@ struct RawBookTicker {
 }
 
 #[derive(Deserialize)]
+struct RawDepth20 {
+    /// Bids: each entry is ["price", "qty"]
+    bids: Vec<[String; 2]>,
+    /// Asks: each entry is ["price", "qty"]
+    asks: Vec<[String; 2]>,
+}
+
+#[derive(Deserialize)]
 struct RawAggTrade {
     #[serde(rename = "s")]
     _symbol: String,
@@ -72,6 +80,21 @@ impl BinanceWs {
                 }
                 Err(e) => {
                     error!(symbol = %self.symbol, error = %e, "Binance bookTicker WS error, reconnecting...");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// Run the depth20@100ms WS loop, reconnecting on failure. Sends BinanceDepth events.
+    pub async fn run_depth(&self, event_tx: mpsc::UnboundedSender<BotEvent>) -> Result<()> {
+        loop {
+            match self.connect_and_listen_depth(&event_tx).await {
+                Ok(()) => {
+                    warn!(symbol = %self.symbol, "Binance depth20 WS closed cleanly, reconnecting...");
+                }
+                Err(e) => {
+                    error!(symbol = %self.symbol, error = %e, "Binance depth20 WS error, reconnecting...");
                 }
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -142,6 +165,67 @@ impl BinanceWs {
                 }
                 Err(e) => {
                     error!(error = %e, "Binance bookTicker WS read error");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn connect_and_listen_depth(
+        &self,
+        event_tx: &mpsc::UnboundedSender<BotEvent>,
+    ) -> Result<()> {
+        let url = format!(
+            "wss://fstream.binance.com/ws/{}@depth20@100ms",
+            self.symbol
+        );
+        info!(url = %url, "Connecting to Binance depth20");
+
+        let (ws, _) = connect_async(&url).await?;
+        let (_, mut read) = ws.split();
+        info!(symbol = %self.symbol, "Binance depth20 connected");
+
+        while let Some(msg) = read.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    match serde_json::from_str::<RawDepth20>(&text) {
+                        Ok(depth) => {
+                            let mut bid_volume = Decimal::ZERO;
+                            for level in &depth.bids {
+                                if let Ok(qty) = level[1].parse::<Decimal>() {
+                                    bid_volume += qty;
+                                }
+                            }
+                            let mut ask_volume = Decimal::ZERO;
+                            for level in &depth.asks {
+                                if let Ok(qty) = level[1].parse::<Decimal>() {
+                                    ask_volume += qty;
+                                }
+                            }
+                            let _ = event_tx.send(BotEvent::BinanceDepth {
+                                bid_volume,
+                                ask_volume,
+                                received_at: Instant::now(),
+                            });
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "Failed to parse Binance depth20");
+                        }
+                    }
+                }
+                Ok(Message::Ping(data)) => {
+                    debug!("Binance depth20 ping");
+                    let _ = data;
+                }
+                Ok(Message::Close(_)) => {
+                    info!("Binance depth20 WS close frame received");
+                    break;
+                }
+                Err(e) => {
+                    error!(error = %e, "Binance depth20 WS read error");
                     break;
                 }
                 _ => {}
