@@ -14,7 +14,8 @@ use extended_strategy::depth_imbalance::DepthImbalanceTracker;
 use extended_strategy::fair_price::FairPriceCalculator;
 use extended_strategy::quote_generator::{ActiveSide, GeneratedQuotes, QuoteGenerator, QuoteInput};
 use extended_strategy::skew::SkewCalculator;
-use extended_strategy::spread::{SpreadCalculator, SpreadInput};
+use chrono::Timelike;
+use extended_strategy::spread::{SpreadCalculator, SpreadInput, SpreadResult};
 use extended_strategy::trade_flow::TradeFlowTracker;
 use extended_strategy::vpin::VpinCalculator;
 use extended_types::events::BotEvent;
@@ -573,14 +574,45 @@ impl MarketBot {
         // Calculate skew
         let skew = self.skew_calc.calculate(inventory_ratio, fair_price);
 
-        // Determine active side based on inventory
+        // Determine active side based on inventory + basis filter + time filter
         let tc = &self.state.config.trading;
         let hard_ratio = Decimal::try_from(tc.hard_one_side_inventory_ratio).unwrap_or(dec!(0.70));
 
-        let active_side = if inventory_ratio.abs() > hard_ratio {
+        let mut active_side = if inventory_ratio.abs() > hard_ratio {
             if inventory_ratio > Decimal::ZERO { ActiveSide::AskOnly } else { ActiveSide::BidOnly }
         } else {
             ActiveSide::Both
+        };
+
+        // Basis filter: block the side that loses when basis is extreme
+        let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
+        if !bn_mid.is_zero() && !fair_price.is_zero() {
+            let basis_bps = ((fair_price - bn_mid) / bn_mid) * dec!(10000);
+            // x10 expensive vs binance → buy is dangerous
+            if basis_bps > dec!(3) {
+                active_side = match active_side {
+                    ActiveSide::Both => ActiveSide::AskOnly,
+                    ActiveSide::BidOnly => { debug!("Basis +3bps: bid blocked by basis filter"); ActiveSide::AskOnly }
+                    other => other,
+                };
+            }
+            // x10 cheap vs binance → sell is dangerous
+            if basis_bps < dec!(-2) {
+                active_side = match active_side {
+                    ActiveSide::Both => ActiveSide::BidOnly,
+                    ActiveSide::AskOnly => { debug!("Basis -2bps: ask blocked by basis filter"); ActiveSide::BidOnly }
+                    other => other,
+                };
+            }
+        }
+
+        // Time filter: widen spread during high adverse selection hours (11-14 UTC)
+        let hour_utc = chrono::Utc::now().hour();
+        let toxic_hours = (11..=14).contains(&hour_utc);
+        let spread_mult = if toxic_hours { dec!(2) } else { Decimal::ONE };
+        let spread = SpreadResult {
+            half_spread: spread.half_spread * spread_mult,
+            spread_bps: spread.spread_bps * spread_mult,
         };
 
         // Get exchange BBO
