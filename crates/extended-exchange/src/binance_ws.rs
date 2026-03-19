@@ -29,8 +29,10 @@ struct RawBookTicker {
 #[derive(Deserialize)]
 struct RawDepth20 {
     /// Bids: each entry is ["price", "qty"]
+    #[serde(rename = "b")]
     bids: Vec<[String; 2]>,
     /// Asks: each entry is ["price", "qty"]
+    #[serde(rename = "a")]
     asks: Vec<[String; 2]>,
 }
 
