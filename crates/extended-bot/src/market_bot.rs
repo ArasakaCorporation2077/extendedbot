@@ -437,8 +437,8 @@ impl MarketBot {
                 }
 
                 // Brief pause so the exchange has time to process the cancel before
-                // new orders arrive. 50ms is well within exchange processing latency.
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                // new orders arrive. 5ms is sufficient for same-region (Tokyo→Tokyo).
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
             Err(e) => {
                 warn!(error = %e, "Mass cancel failed");
