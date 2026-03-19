@@ -166,13 +166,8 @@ impl MarketBot {
                     self.on_orderbook_update(bids, asks, is_snapshot, ts).await;
                 }
             }
-            BotEvent::TradeUpdate { market, trades } => {
-                if market == self.state.market() {
-                    for trade in &trades {
-                        self.vpin_calc.on_trade(trade.size, !trade.is_buyer_maker);
-                        // Vol estimator fed by Binance BBO only — don't mix x10 trades
-                    }
-                }
+            BotEvent::TradeUpdate { .. } => {
+                // x10 trades — no longer used for VPIN (moved to Binance aggTrade)
             }
             BotEvent::MarkPrice { market, price } => {
                 if market == self.state.market() {
@@ -196,6 +191,9 @@ impl MarketBot {
                 // No cancel here — avoids cancel storm from high-freq Binance ticks.
             }
             BotEvent::BinanceTrade { qty, is_buyer_maker, received_at, .. } => {
+                // VPIN from Binance trades — much faster signal than x10
+                // is_buyer_maker=true → seller is aggressor → !is_buyer_maker = is_buy
+                self.vpin_calc.on_trade(qty, !is_buyer_maker);
                 self.trade_flow.on_trade(qty, is_buyer_maker, received_at);
             }
             BotEvent::FundingRate { .. } => {

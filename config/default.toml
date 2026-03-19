@@ -39,8 +39,9 @@ max_size_multiplier = 1.8
 emergency_flatten_ratio = 0.8
 
 # VPIN
-vpin_bucket_volume = 1.0
-vpin_num_buckets = 20
+# VPIN now fed by Binance aggTrade — larger buckets for higher volume
+vpin_bucket_volume = 10.0
+vpin_num_buckets = 50
 
 # Multi-level quoting
 num_levels = 2
