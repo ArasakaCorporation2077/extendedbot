@@ -504,8 +504,15 @@ impl MarketBot {
         let market = self.state.market().to_string();
         let inventory_ratio = self.state.position_manager.inventory_ratio(&market);
 
-        // Calculate spread
-        let vpin_mult = SpreadCalculator::vpin_multiplier(self.vpin_calc.vpin());
+        // Calculate spread — uses sustained toxic detection (8+ consecutive elevated bars)
+        let vpin_mult = self.vpin_calc.spread_multiplier();
+        if self.vpin_calc.is_sustained_toxic() {
+            warn!(
+                vpin = %self.vpin_calc.vpin(),
+                consecutive = self.vpin_calc.consecutive_elevated_count(),
+                "Sustained toxic flow detected — spread 3x"
+            );
+        }
 
         // Rolling realized volatility from recent trade prices (bps).
         let volatility_bps = self.vol_estimator.volatility_bps();

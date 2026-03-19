@@ -11,6 +11,12 @@ pub struct VpinCalculator {
     current_sell: Decimal,
     current_total: Decimal,
     cached_vpin: Decimal,
+    /// Count of consecutive buckets where VPIN > elevated threshold (0.7).
+    consecutive_elevated: u32,
+    /// Threshold for "elevated" VPIN.
+    elevated_threshold: Decimal,
+    /// How many consecutive elevated bars before sustained toxic mode.
+    sustained_bars: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +32,9 @@ impl VpinCalculator {
             current_sell: Decimal::ZERO,
             current_total: Decimal::ZERO,
             cached_vpin: Decimal::ZERO,
+            consecutive_elevated: 0,
+            elevated_threshold: dec!(0.7),
+            sustained_bars: 8,
         }
     }
 
@@ -56,6 +65,13 @@ impl VpinCalculator {
         let total_volume = n * self.bucket_volume;
         if total_volume.is_zero() { self.cached_vpin = Decimal::ZERO; return; }
         self.cached_vpin = sum_abs_diff / total_volume;
+
+        // Track consecutive elevated bars
+        if self.cached_vpin > self.elevated_threshold {
+            self.consecutive_elevated += 1;
+        } else {
+            self.consecutive_elevated = 0;
+        }
     }
 
     pub fn vpin(&self) -> Decimal { self.cached_vpin }
@@ -67,7 +83,22 @@ impl VpinCalculator {
         else { ToxicityLevel::Low }
     }
 
+    /// Whether VPIN has been elevated for sustained_bars+ consecutive buckets.
+    /// This is a stronger signal than a single spike — indicates persistent informed flow.
+    pub fn is_sustained_toxic(&self) -> bool {
+        self.consecutive_elevated >= self.sustained_bars
+    }
+
+    /// Consecutive elevated bar count.
+    pub fn consecutive_elevated_count(&self) -> u32 {
+        self.consecutive_elevated
+    }
+
     pub fn spread_multiplier(&self) -> Decimal {
+        // Sustained toxic → maximum widening regardless of current VPIN level
+        if self.is_sustained_toxic() {
+            return dec!(3.0);
+        }
         match self.toxicity() {
             ToxicityLevel::Critical => dec!(3.0),
             ToxicityLevel::High => dec!(2.0),
