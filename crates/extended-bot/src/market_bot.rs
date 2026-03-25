@@ -594,40 +594,29 @@ impl MarketBot {
             ActiveSide::Both
         };
 
-        // Basis filter: block the side that loses when basis is extreme
+        // Basis filter: block the side that loses when basis is extreme.
+        // ONLY applies when active_side is Both — never override inventory skew.
+        // Inventory skew (AskOnly/BidOnly) is for unwinding positions and must take priority.
         let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
-        if !bn_mid.is_zero() && !fair_price.is_zero() {
+        if active_side == ActiveSide::Both && !bn_mid.is_zero() && !fair_price.is_zero() {
             let basis_bps = ((fair_price - bn_mid) / bn_mid) * dec!(10000);
-            // x10 expensive vs binance → buy is dangerous
             if basis_bps > dec!(3) {
-                active_side = match active_side {
-                    ActiveSide::Both => ActiveSide::AskOnly,
-                    ActiveSide::BidOnly => { debug!("Basis +3bps: bid blocked by basis filter"); ActiveSide::AskOnly }
-                    other => other,
-                };
+                active_side = ActiveSide::AskOnly;
             }
-            // x10 cheap vs binance → sell is dangerous
             if basis_bps < dec!(-2) {
-                active_side = match active_side {
-                    ActiveSide::Both => ActiveSide::BidOnly,
-                    ActiveSide::AskOnly => { debug!("Basis -2bps: ask blocked by basis filter"); ActiveSide::BidOnly }
-                    other => other,
-                };
+                active_side = ActiveSide::BidOnly;
             }
         }
 
-        // Spread multiplier: take MAX of VPIN and time-of-day, not multiply both.
-        // VPIN multiplier is already in spread from SpreadCalculator.
-        // Time filter only applies if VPIN isn't already elevated.
+        // Time filter: add fixed bps during toxic hours instead of multiplying.
+        // Multiplying was causing inventory_spread to double → unwind impossible.
         let hour_utc = chrono::Utc::now().hour();
         let toxic_hours = (11..=14).contains(&hour_utc);
-        let vpin_mult = self.vpin_calc.spread_multiplier();
-        let time_mult = if toxic_hours { dec!(2) } else { Decimal::ONE };
-        // Only apply time_mult if it's larger than VPIN mult (avoid double-widening)
-        let extra_mult = if time_mult > vpin_mult { time_mult / vpin_mult } else { Decimal::ONE };
+        let toxic_extra_bps = if toxic_hours { dec!(2.0) } else { Decimal::ZERO };
+        let toxic_extra_half = extended_types::decimal_utils::bps_to_ratio(toxic_extra_bps) / dec!(2);
         let spread = SpreadResult {
-            half_spread: spread.half_spread * extra_mult,
-            spread_bps: spread.spread_bps * extra_mult,
+            half_spread: spread.half_spread + toxic_extra_half,
+            spread_bps: spread.spread_bps + toxic_extra_bps,
         };
 
         // Unwind acceleration: when holding a position, reduce margin on the unwind side
