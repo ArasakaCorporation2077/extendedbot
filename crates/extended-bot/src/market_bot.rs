@@ -342,10 +342,14 @@ impl MarketBot {
         };
 
         // Backoff interval when orders keep failing (balance insufficient etc.)
-        let effective_interval = if self.consecutive_rejects >= 3 {
-            Duration::from_secs(10) // Back off to 10s after 3+ consecutive rejects
+        // Cap at 2s to avoid getting stuck. Reset after 5 consecutive rejects.
+        let effective_interval = if self.consecutive_rejects >= 5 {
+            self.consecutive_rejects = 0; // Reset to retry
+            min_interval
+        } else if self.consecutive_rejects >= 3 {
+            Duration::from_secs(2)
         } else if !has_live_orders && self.last_quoted_fp.is_some() {
-            Duration::from_secs(1) // No live orders but we tried before: 1s
+            Duration::from_secs(1)
         } else {
             min_interval
         };
@@ -612,13 +616,18 @@ impl MarketBot {
             }
         }
 
-        // Time filter: widen spread during high adverse selection hours (11-14 UTC)
+        // Spread multiplier: take MAX of VPIN and time-of-day, not multiply both.
+        // VPIN multiplier is already in spread from SpreadCalculator.
+        // Time filter only applies if VPIN isn't already elevated.
         let hour_utc = chrono::Utc::now().hour();
         let toxic_hours = (11..=14).contains(&hour_utc);
-        let spread_mult = if toxic_hours { dec!(2) } else { Decimal::ONE };
+        let vpin_mult = self.vpin_calc.spread_multiplier();
+        let time_mult = if toxic_hours { dec!(2) } else { Decimal::ONE };
+        // Only apply time_mult if it's larger than VPIN mult (avoid double-widening)
+        let extra_mult = if time_mult > vpin_mult { time_mult / vpin_mult } else { Decimal::ONE };
         let spread = SpreadResult {
-            half_spread: spread.half_spread * spread_mult,
-            spread_bps: spread.spread_bps * spread_mult,
+            half_spread: spread.half_spread * extra_mult,
+            spread_bps: spread.spread_bps * extra_mult,
         };
 
         // Asymmetric spread: sell side 0.7bps wider (regression: sell is 1.44bps worse than buy)
