@@ -64,6 +64,11 @@ impl QuoteGenerator {
         self
     }
 
+    /// Dynamically update margin_bps (e.g. reduce for unwind side).
+    pub fn set_margin_bps(&mut self, margin_bps: Decimal) {
+        self.best_price_margin_bps = margin_bps;
+    }
+
     pub fn generate(&self, input: &QuoteInput) -> GeneratedQuotes {
         let half_spread_ratio = input.spread.half_spread;
         let fp = input.fair_price;

@@ -630,10 +630,9 @@ impl MarketBot {
             spread_bps: spread.spread_bps * extra_mult,
         };
 
-        // Asymmetric spread: sell side 0.7bps wider (regression: sell is 1.44bps worse than buy)
-        let sell_extra_half_bps = dec!(0.7);
-        let sell_extra_half = extended_types::decimal_utils::bps_to_ratio(sell_extra_half_bps);
-        let ask_spread_offset = sell_extra_half;
+        // Unwind acceleration: when holding a position, reduce margin on the unwind side
+        // so it sits closer to BBO and fills faster. Prevents holding positions too long.
+        let ask_spread_offset = Decimal::ZERO; // No asymmetric spread — was causing sell to never fill
 
         // Get exchange BBO
         let exchange_best_bid = self.state.orderbook.best_bid().map(|l| l.price);
@@ -654,6 +653,21 @@ impl MarketBot {
             bid_size_mult: skew.bid_size_mult,
             ask_size_mult: skew.ask_size_mult,
         };
+
+        // Dynamic margin: reduce margin on unwind side so positions close faster.
+        // Normal margin from config. When holding position, unwind side gets 0.3bps margin.
+        let base_margin = Decimal::try_from(tc.best_price_margin_bps).unwrap_or(dec!(1.0));
+        let unwind_margin = dec!(0.3);
+        if inventory_ratio.abs() > dec!(0.1) {
+            // Has meaningful position → tighten unwind side
+            // Inventory > 0 (long) → sell is unwind → tighten ask
+            // Inventory < 0 (short) → buy is unwind → tighten bid
+            // We can't set per-side margin in quote_gen, so use the tighter one
+            // when position is significant. Skew already shifts quotes directionally.
+            self.quote_gen.set_margin_bps(unwind_margin);
+        } else {
+            self.quote_gen.set_margin_bps(base_margin);
+        }
 
         let input = QuoteInput {
             fair_price,

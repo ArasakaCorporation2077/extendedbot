@@ -22,8 +22,8 @@ update_threshold_bps = 3.0
 min_requote_interval_ms = 500
 
 # Spread
-base_spread_bps = 4.0
-min_spread_bps = 2.5
+base_spread_bps = 2.5
+min_spread_bps = 1.5
 max_spread_bps = 20.0
 volatility_sensitivity = 0.5
 latency_vol_multiplier = 2.0
@@ -54,11 +54,15 @@ max_order_age_s = 5.0
 
 # Best price tighten
 best_price_tighten_enabled = true
-best_price_margin_bps = 0.1
+best_price_margin_bps = 1.0
 
 # Close mode
 close_threshold_ratio = 0.25
 close_spread_bps = 4.0
+
+# Trade flow / depth imbalance (regression-optimized from 1,427 fills)
+trade_flow_sensitivity_bps = 0.5
+depth_imbalance_sensitivity_bps = 0.3
 
 # Inventory thresholds
 one_side_inventory_ratio = 0.45
