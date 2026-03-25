@@ -195,14 +195,16 @@ impl BinanceWs {
                 Ok(Message::Text(text)) => {
                     match serde_json::from_str::<RawDepth20>(&text) {
                         Ok(depth) => {
+                            // Top 3 levels only — research shows top-of-book imbalance
+                            // is stronger predictor than deep book aggregate.
                             let mut bid_volume = Decimal::ZERO;
-                            for level in &depth.bids {
+                            for level in depth.bids.iter().take(3) {
                                 if let Ok(qty) = level[1].parse::<Decimal>() {
                                     bid_volume += qty;
                                 }
                             }
                             let mut ask_volume = Decimal::ZERO;
-                            for level in &depth.asks {
+                            for level in depth.asks.iter().take(3) {
                                 if let Ok(qty) = level[1].parse::<Decimal>() {
                                     ask_volume += qty;
                                 }
