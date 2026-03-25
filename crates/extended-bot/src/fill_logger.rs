@@ -55,4 +55,12 @@ pub struct FillRecord {
     pub binance_mid: Option<Decimal>,
     /// order-to-fill latency ms
     pub order_to_fill_ms: Option<u64>,
+    /// Binance trade flow imbalance [-1, +1] at time of fill
+    pub flow_imbalance: Option<f64>,
+    /// Binance depth imbalance [-1, +1] at time of fill
+    pub depth_imbalance: Option<f64>,
+    /// Spread in bps at time of fill
+    pub spread_bps: Option<f64>,
+    /// Volatility in bps at time of fill
+    pub volatility_bps: Option<f64>,
 }

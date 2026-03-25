@@ -13,7 +13,7 @@ use extended_risk::fast_cancel::{FastCancel, LiveOrderInfo};
 use extended_strategy::depth_imbalance::DepthImbalanceTracker;
 use extended_strategy::fair_price::FairPriceCalculator;
 use extended_strategy::quote_generator::{ActiveSide, GeneratedQuotes, QuoteGenerator, QuoteInput};
-use extended_strategy::skew::SkewCalculator;
+use extended_strategy::skew::{SkewCalculator, SkewResult};
 use chrono::Timelike;
 use extended_strategy::spread::{SpreadCalculator, SpreadInput, SpreadResult};
 use extended_strategy::trade_flow::TradeFlowTracker;
@@ -87,6 +87,8 @@ pub struct MarketBot {
     last_fast_cancel: Option<Instant>,
     last_binance_tick: Option<Instant>,
     last_quoted_fp: Option<Decimal>,
+    last_flow_imbalance: f64,
+    last_depth_imbalance: f64,
     consecutive_rejects: u32,
     order_seq: u64,
 }
@@ -160,6 +162,8 @@ impl MarketBot {
             last_fast_cancel: None,
             last_binance_tick: None,
             last_quoted_fp: None,
+            last_flow_imbalance: 0.0,
+            last_depth_imbalance: 0.0,
             consecutive_rejects: 0,
             order_seq: 0,
         }
@@ -390,6 +394,8 @@ impl MarketBot {
             let tc = &self.state.config.trading;
             let flow_sensitivity = Decimal::try_from(tc.trade_flow_sensitivity_bps).unwrap_or(dec!(1.0));
             let flow_imbalance = self.trade_flow.imbalance();
+            self.last_flow_imbalance = flow_imbalance.to_string().parse::<f64>().unwrap_or(0.0);
+            self.last_depth_imbalance = self.depth_imbalance.imbalance().to_string().parse::<f64>().unwrap_or(0.0);
             let flow_shift_bps = flow_imbalance * flow_sensitivity;
             let flow_shift_price = TradeFlowTracker::bps_to_price_shift(flow_shift_bps, fp);
             let depth_shift_bps = self.depth_imbalance.shift_bps(tc.depth_imbalance_sensitivity_bps);
@@ -615,6 +621,11 @@ impl MarketBot {
             spread_bps: spread.spread_bps * spread_mult,
         };
 
+        // Asymmetric spread: sell side 0.7bps wider (regression: sell is 1.44bps worse than buy)
+        let sell_extra_half_bps = dec!(0.7);
+        let sell_extra_half = extended_types::decimal_utils::bps_to_ratio(sell_extra_half_bps);
+        let ask_spread_offset = sell_extra_half;
+
         // Get exchange BBO
         let exchange_best_bid = self.state.orderbook.best_bid().map(|l| l.price);
         let exchange_best_ask = self.state.orderbook.best_ask().map(|l| l.price);
@@ -627,10 +638,18 @@ impl MarketBot {
             dec!(0.001)
         };
 
+        // Asymmetric skew: widen ask by sell_extra (regression: sell 1.44bps worse than buy)
+        let adjusted_skew = SkewResult {
+            bid_price_offset: skew.bid_price_offset,
+            ask_price_offset: skew.ask_price_offset + ask_spread_offset * fair_price,
+            bid_size_mult: skew.bid_size_mult,
+            ask_size_mult: skew.ask_size_mult,
+        };
+
         let input = QuoteInput {
             fair_price,
             spread,
-            skew,
+            skew: adjusted_skew,
             active_side,
             base_size,
             size_multiplier: Decimal::ONE,
@@ -947,6 +966,8 @@ impl MarketBot {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        let flow_imb = self.last_flow_imbalance;
+        let depth_imb = self.last_depth_imbalance;
         self.state.fill_logger.log(&crate::fill_logger::FillRecord {
             ts_ms,
             market: market.clone(),
@@ -961,6 +982,10 @@ impl MarketBot {
             local_mid: self.state.orderbook.mid(),
             binance_mid: *self.state.binance_mid.read(),
             order_to_fill_ms,
+            flow_imbalance: Some(flow_imb.to_string().parse::<f64>().unwrap_or(0.0)),
+            depth_imbalance: Some(depth_imb.to_string().parse::<f64>().unwrap_or(0.0)),
+            spread_bps: None, // TODO: pass from last requote
+            volatility_bps: None,
         });
     }
 
