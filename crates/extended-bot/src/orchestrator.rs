@@ -348,9 +348,9 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
 
             _ = watchdog_interval.tick() => {
                 let idle_secs = last_event_time.elapsed().as_secs();
-                if idle_secs > 300 {
-                    // No events for 5 minutes — WS probably dead
-                    error!(idle_secs, "WATCHDOG: no events for 5 minutes — forcing emergency cancel + process exit");
+                if idle_secs > 180 {
+                    // No events for 3 minutes — WS probably dead
+                    error!(idle_secs, "WATCHDOG: no events for 3 minutes — forcing emergency cancel + process exit");
                     if !config.exchange.paper_trading && !smoke_mode {
                         let _ = state.adapter.mass_cancel(state.market()).await;
                     }
