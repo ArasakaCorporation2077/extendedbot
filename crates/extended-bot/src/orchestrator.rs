@@ -317,6 +317,8 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
     let mut dms_interval = tokio::time::interval(Duration::from_secs(
         (config.trading.dead_man_switch_timeout_ms / 3000).max(10),
     ));
+    let mut watchdog_interval = tokio::time::interval(Duration::from_secs(60));
+    let mut last_event_time = std::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -340,7 +342,23 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
             }
 
             Some(event) = event_rx.recv() => {
+                last_event_time = std::time::Instant::now();
                 bot.handle_event(event).await;
+            }
+
+            _ = watchdog_interval.tick() => {
+                let idle_secs = last_event_time.elapsed().as_secs();
+                if idle_secs > 300 {
+                    // No events for 5 minutes — WS probably dead
+                    error!(idle_secs, "WATCHDOG: no events for 5 minutes — forcing emergency cancel + process exit");
+                    if !config.exchange.paper_trading && !smoke_mode {
+                        let _ = state.adapter.mass_cancel(state.market()).await;
+                    }
+                    // Exit process — systemd/nohup wrapper will restart
+                    std::process::exit(1);
+                } else if idle_secs > 120 {
+                    warn!(idle_secs, "WATCHDOG: no events for 2+ minutes — WS may be stale");
+                }
             }
 
             _ = markout_tick.tick() => {
