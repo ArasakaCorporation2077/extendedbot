@@ -6,10 +6,10 @@ user_agent = "extended-mm/0.1.0"
 # API key and secret from env: EXTENDED_API_KEY, EXTENDED_API_SECRET
 
 [trading]
-market = "CRCL_24_5-USD"
-order_size_usd = 20.0
+market = "TAO-USD"
+order_size_usd = 15.0
 min_order_usd = 10.0
-max_order_usd = 50.0
+max_order_usd = 30.0
 leverage = 5
 
 # Expiry: mainnet supports up to 90 days

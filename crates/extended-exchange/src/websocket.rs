@@ -87,18 +87,18 @@ impl ExtendedWebSocket {
     /// Connect and run the WebSocket event loop.
     /// Auto-reconnects on disconnection with exponential backoff.
     pub async fn run(&self, event_tx: mpsc::UnboundedSender<BotEvent>) -> Result<()> {
-        let mut backoff = Duration::from_secs(1);
-        let max_backoff = Duration::from_secs(30);
+        let mut backoff = Duration::from_secs(10);
+        let max_backoff = Duration::from_secs(60);
 
         loop {
             let connect_start = std::time::Instant::now();
             match self.connect_and_listen(&event_tx).await {
                 Ok(()) => {
-                    // Server sends "Session timeout" close — auto-reconnect with small delay
-                    // to avoid thundering herd when all 4 streams timeout simultaneously.
-                    info!(stream = ?self.stream, "WebSocket closed cleanly (session timeout), reconnecting in 2s");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    backoff = Duration::from_secs(2);
+                    // Server sends "Session timeout" close — reconnect with 10s delay
+                    // to avoid CloudFront WAF blocking from too many reconnections.
+                    info!(stream = ?self.stream, "WebSocket closed cleanly (session timeout), reconnecting in 10s");
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    backoff = Duration::from_secs(10);
                     continue;
                 }
                 Err(e) => {
@@ -110,10 +110,9 @@ impl ExtendedWebSocket {
                         stream: format!("{:?}", self.stream),
                     });
 
-                    // Reset backoff if connection survived > 10s (was healthy),
-                    // but keep minimum at 2s to avoid thundering herd on 429 errors.
-                    if connect_start.elapsed() > Duration::from_secs(10) {
-                        backoff = Duration::from_secs(2);
+                    // Reset backoff if connection survived > 30s (was healthy).
+                    if connect_start.elapsed() > Duration::from_secs(30) {
+                        backoff = Duration::from_secs(10);
                     }
 
                     warn!(backoff_ms = backoff.as_millis(), "Reconnecting after backoff");
