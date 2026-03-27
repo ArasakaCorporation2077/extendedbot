@@ -6,10 +6,10 @@ user_agent = "extended-mm/0.1.0"
 # API key and secret from env: EXTENDED_API_KEY, EXTENDED_API_SECRET
 
 [trading]
-market = "BTC-USD"
-order_size_usd = 30.0
-min_order_usd = 20.0
-max_order_usd = 100.0
+market = "CRCL_24_5-USD"
+order_size_usd = 20.0
+min_order_usd = 10.0
+max_order_usd = 50.0
 leverage = 5
 
 # Expiry: mainnet supports up to 90 days
@@ -22,8 +22,8 @@ update_threshold_bps = 3.0
 min_requote_interval_ms = 500
 
 # Spread
-base_spread_bps = 2.5
-min_spread_bps = 1.5
+base_spread_bps = 4.0
+min_spread_bps = 2.0
 max_spread_bps = 20.0
 volatility_sensitivity = 0.5
 latency_vol_multiplier = 2.0
@@ -40,7 +40,7 @@ emergency_flatten_ratio = 0.8
 
 # VPIN
 # VPIN now fed by Binance aggTrade — larger buckets for higher volume
-vpin_bucket_volume = 10.0
+vpin_bucket_volume = 5.0
 vpin_num_buckets = 50
 
 # Multi-level quoting
@@ -69,7 +69,7 @@ one_side_inventory_ratio = 0.45
 hard_one_side_inventory_ratio = 0.70
 
 [risk]
-max_position_usd = 200.0
+max_position_usd = 50.0
 max_daily_loss_usd = 500.0
 max_orders_per_minute = 300
 max_errors_per_minute = 10

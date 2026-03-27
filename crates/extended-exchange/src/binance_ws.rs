@@ -68,9 +68,12 @@ impl BinanceWs {
     }
 
     /// Map x10 market name (e.g. "BTC-USD") to Binance futures symbol ("btcusdt").
+    /// Handles stock perp format like "CRCL_24_5-USD" → "crclusdt" (strip date suffix).
     pub fn from_market(market: &str) -> Self {
         let base = market.split('-').next().unwrap_or("BTC");
-        Self::new(&format!("{}usdt", base.to_lowercase()))
+        // Strip date suffix like _24_5, _25_1 etc for stock perps
+        let clean = base.split('_').next().unwrap_or(base);
+        Self::new(&format!("{}usdt", clean.to_lowercase()))
     }
 
     /// Run the bookTicker WS loop, reconnecting on failure. Sends BinanceBbo events.
