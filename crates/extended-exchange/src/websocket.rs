@@ -87,7 +87,7 @@ impl ExtendedWebSocket {
     /// Connect and run the WebSocket event loop.
     /// Auto-reconnects on disconnection with exponential backoff.
     pub async fn run(&self, event_tx: mpsc::UnboundedSender<BotEvent>) -> Result<()> {
-        let mut backoff = Duration::from_secs(10);
+        let mut backoff = Duration::from_secs(5);
         let max_backoff = Duration::from_secs(60);
 
         loop {
@@ -96,9 +96,9 @@ impl ExtendedWebSocket {
                 Ok(()) => {
                     // Server sends "Session timeout" close — reconnect with 10s delay
                     // to avoid CloudFront WAF blocking from too many reconnections.
-                    info!(stream = ?self.stream, "WebSocket closed cleanly (session timeout), reconnecting in 10s");
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                    backoff = Duration::from_secs(10);
+                    info!(stream = ?self.stream, "WebSocket closed cleanly (session timeout), reconnecting in 5s");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    backoff = Duration::from_secs(5);
                     continue;
                 }
                 Err(e) => {
@@ -111,8 +111,8 @@ impl ExtendedWebSocket {
                     });
 
                     // Reset backoff if connection survived > 30s (was healthy).
-                    if connect_start.elapsed() > Duration::from_secs(30) {
-                        backoff = Duration::from_secs(10);
+                    if connect_start.elapsed() > Duration::from_secs(15) {
+                        backoff = Duration::from_secs(5);
                     }
 
                     warn!(backoff_ms = backoff.as_millis(), "Reconnecting after backoff");
