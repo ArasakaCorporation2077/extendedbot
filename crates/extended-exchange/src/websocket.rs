@@ -142,7 +142,7 @@ impl ExtendedWebSocket {
             self.base_ws_url.replace("wss://", "https://").replace("ws://", "http://")
         };
         request.headers_mut().insert("Origin",
-            origin.parse().unwrap_or_else(|_| "https://app.extended.exchange".parse().unwrap()));
+            origin.parse().unwrap_or_else(|_| "https://api.starknet.extended.exchange".parse().unwrap()));
         if self.needs_auth() {
             request.headers_mut().insert("X-Api-Key",
                 self.api_key.parse().unwrap_or_else(|_| "".parse().unwrap()));

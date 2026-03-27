@@ -33,7 +33,7 @@ impl ExchangeConfig {
     }
 
     pub fn ws_url(&self) -> &str {
-        "wss://app.extended.exchange"
+        "wss://api.starknet.extended.exchange"
     }
 }
 
