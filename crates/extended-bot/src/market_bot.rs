@@ -643,17 +643,11 @@ impl MarketBot {
             ask_size_mult: skew.ask_size_mult,
         };
 
-        // Dynamic margin: reduce margin on unwind side so positions close faster.
-        // Normal margin from config. When holding position, unwind side gets 0.3bps margin.
+        // Dynamic margin: when holding position, set margin to 0 on unwind side
+        // so it sits at BBO front → fills within 1 second instead of holding for minutes.
         let base_margin = Decimal::try_from(tc.best_price_margin_bps).unwrap_or(dec!(1.0));
-        let unwind_margin = dec!(0.3);
         if inventory_ratio.abs() > dec!(0.1) {
-            // Has meaningful position → tighten unwind side
-            // Inventory > 0 (long) → sell is unwind → tighten ask
-            // Inventory < 0 (short) → buy is unwind → tighten bid
-            // We can't set per-side margin in quote_gen, so use the tighter one
-            // when position is significant. Skew already shifts quotes directionally.
-            self.quote_gen.set_margin_bps(unwind_margin);
+            self.quote_gen.set_margin_bps(Decimal::ZERO);
         } else {
             self.quote_gen.set_margin_bps(base_margin);
         }
