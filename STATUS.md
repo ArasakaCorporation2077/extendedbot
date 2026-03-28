@@ -171,6 +171,15 @@ adj = raw - binance_market_movement
 - 원인: informed trader와 같은 RTT(11ms), 시그널 edge 없음 (R²=0.03)
 - 현재: TAO-USD로 이동 (스프레드 넓고 경쟁 적은 마켓)
 
+### 해결 방향: edge 확보 필요
+파라미터 튜닝만으로는 한계. 수익 전환하려면 다음 중 하나 이상 필요:
+1. **Fair price edge** — 바이낸스 mid보다 나은 가격 예측. microprice, VAMP, 다중 거래소 리드-래그
+2. **시그널 edge** — R²=0.03을 높일 feature 발굴. order flow conditional on fill, regime detection
+3. **구조적 edge** — 포인트 파머 상대 MM, funding rate 캐리, 경쟁 적은 마켓에서 스프레드 캡처
+4. **실행 edge** — 큰 resting order 뒤에 서기 (order placement), fill 후 즉시 unwind
+
+현재 3번(구조적 edge) 방향으로 TAO-USD 테스트 중. 데이터 모아서 1-4번 중 가능한 것 찾기.
+
 ---
 
 ## 마켓별 성과 기록
