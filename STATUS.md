@@ -3,8 +3,130 @@
 ## 현재 상태
 - **마켓**: TAO-USD (이전: BTC-USD, WIF-USD, CRCL_24_5-USD)
 - **EC2**: 54.199.221.223 (ap-northeast-1, t2.small)
-- **잔고**: ~$57
-- **봇 상태**: 실행 중, TAO fill 수집 중
+- **이전 EC2 IP**: 3.112.37.210 (변경됨)
+- **잔고**: ~$57 (시작 $104, 총 손실 ~$47)
+- **봇 상태**: 정지됨, 포지션 없음, 재시작 대기
+- **SSH**: `ssh -i extendedMM.pem ec2-user@54.199.221.223`
+- **Bot path**: `~/extendedMM/target/release/extended-mm`
+- **Auto-restart**: `run.sh` (nohup wrapper, watchdog 3분)
+- **GitHub**: https://github.com/ArasakaCorporation2077/extendedbot.git (private)
+
+---
+
+## 코드 구조 (8-crate workspace)
+
+```
+extended-types/     — 공유 타입 (Decimal, Side, OrderStatus, Config, BotEvent)
+extended-crypto/    — Pedersen hash, ECDSA signing for Starknet (mainnet only)
+extended-exchange/  — REST client + WebSocket client + Binance WS + OrderTracker
+extended-orderbook/ — BTreeMap 기반 local orderbook
+extended-risk/      — PositionManager, ExposureTracker, CircuitBreaker, MarkoutTracker, LatencyTracker
+extended-strategy/  — FairPriceCalculator, SpreadCalculator, SkewCalculator, QuoteGenerator, VpinCalculator, TradeFlowTracker, DepthImbalanceTracker
+extended-paper/     — Paper trading 시뮬레이션
+extended-bot/       — MarketBot (메인 루프), Orchestrator (시작/종료), State, FillLogger
+```
+
+### 핵심 파일 & 역할
+
+**crates/extended-bot/src/market_bot.rs** — 메인 트레이딩 루프
+- `handle_event()`: 모든 이벤트(orderbook, trade, binance, fill, order update) 처리
+- `on_orderbook_update()`: HOT PATH — orderbook 업데이트 → fair price → cancel → requote
+- `requote()`: spread 계산 → skew 계산 → 필터(basis, time, inventory) → quote 생성 → 주문 제출
+- `cancel_all_live()`: mass_cancel REST 1회로 전체 취소
+- `on_fill()`: PnL 계산, fills.jsonl 기록, markout 등록
+
+**crates/extended-bot/src/orchestrator.rs** — 시작/종료/이벤트 루프
+- 봇 초기화: signer warmup → HTTP pool warmup → market config → leverage 설정 → state bootstrap
+- WS 스폰: orderbook, trades, markPrice, private, binance(bookTicker, aggTrade, depth20)
+- 메인 select! 루프: event_rx, cleanup(30s), reconcile(60s), markout tick(50ms), DMS heartbeat, watchdog(60s)
+- watchdog: 3분 idle → exit(1) → run.sh가 재시작
+
+**crates/extended-strategy/src/fair_price.rs** — Fair Value 계산
+```
+fair_price   = binance_mid          (즉시 반응, fast cancel 기준)
+basis_offset = EWMA(x10_mid - binance_mid, alpha=0.01)  (느린 추적)
+quote_price  = fair_price + basis_offset  (호가 위치 = x10 orderbook 기준)
+```
+- `update_local_mid()`: x10 orderbook mid 업데이트
+- `update_reference_mid()`: 바이낸스 mid 업데이트
+- `quote_price()`: fair_price + basis_offset (QuoteInput에 전달)
+
+**crates/extended-strategy/src/spread.rs** — 스프레드 계산
+```
+spread = (base_spread + vol × sensitivity) × vpin_mult + inventory_spread + markout_adj
+clamped to [min_spread, max_spread]
+```
+- `volatility_bps`: VolatilityEstimator (바이낸스 BBO mid 기반, 500 samples)
+- `vpin_multiplier`: VPIN > 0.85 sustained 20+ bars → 3x
+- `inventory_spread`: |inventory_ratio| × 2.0
+- `markout_adj`: tox_score (max(0,-raw_500ms) + max(0,-adj_5s))
+
+**crates/extended-strategy/src/skew.rs** — Avellaneda-Stoikov 기반 스큐
+```
+skew = price_skew_bps × inventory_ratio² × mid_price
+Long → 호가 아래로 shift (팔기 쉽게)
+Short → 호가 위로 shift (사기 쉽게)
+Size skew: 반대편 크기 키움
+Emergency flatten: 80% → 한쪽 중단
+```
+
+**crates/extended-strategy/src/quote_generator.rs** — 호가 생성
+```
+bid = quote_price × (1 - half_spread) + skew_offset
+ask = quote_price × (1 + half_spread) + skew_offset
+```
+- `best_price_tighten`: BBO에서 margin_bps 뒤에 서기 (현재 1.0bps)
+- `post_only_no_cross`: 절대 taker 안 됨
+- `num_levels`: 다중 레벨 (size_step×10 미만이면 자동 스킵)
+- 포지션 있을 때 unwind margin = 0 (BBO 최우선)
+
+**crates/extended-strategy/src/trade_flow.rs** — 바이낸스 aggTrade 기반 buy/sell 불균형
+- 5초 rolling window, imbalance [-1, +1]
+- sensitivity 0.5bps (regression 최적값)
+
+**crates/extended-strategy/src/depth_imbalance.rs** — 바이낸스 depth20 top 3 level 불균형
+- EWMA alpha=0.3, imbalance [-1, +1]
+- sensitivity 0.3bps (regression 최적값)
+
+**crates/extended-strategy/src/vpin.rs** — Volume-Synced Probability of Informed Trading
+- 바이낸스 aggTrade 기반 (x10이 아님)
+- bucket 5.0, 50 buckets
+- sustained toxic: threshold 0.85, 20+ bars → spread 3x
+- spread_multiplier: Low 1x, Medium 1.5x, High 2x, Critical/Sustained 3x
+
+**crates/extended-risk/src/markout.rs** — 체결 품질 측정
+```
+raw = (future_x10_mid - fill_price) × direction
+adj = raw - binance_market_movement
+```
+- 5개 horizon: 50, 200, 500, 1000, 5000ms
+- EWMA alpha=0.2
+- tox_score = max(0, -raw_500ms) + max(0, -adj_5s)
+- feedback_bps → spread 확대에 사용 (항상 ≥ 0, 축소 안 함)
+- markouts.jsonl 기록
+
+**crates/extended-exchange/src/binance_ws.rs** — 바이낸스 WS 클라이언트
+- 3개 스트림: bookTicker(BBO), aggTrade(체결), depth20(오더북 top 20)
+- `from_market()`: x10 심볼 → 바이낸스 심볼 자동 매핑 (날짜 접미사 제거)
+- depth20: top 3 level만 합산 (research: top-of-book이 예측력 높음)
+
+**crates/extended-exchange/src/websocket.rs** — x10 WS 클라이언트
+- 호스트: `wss://api.starknet.extended.exchange` (NOT app.extended.exchange)
+- 4개 스트림: orderbook, trades, markPrice, private(account)
+- session timeout ~15초 → 5초 후 재연결
+- max backoff 60초
+
+**crates/extended-exchange/src/rest.rs** — x10 REST 클라이언트
+- nonce: unix_timestamp % 1B (재시작 시 중복 방지)
+- rate limiter: proactive token bucket (16.67 req/sec, burst 30)
+- leverage get/set API
+- mass_cancel (단일 REST로 전체 취소)
+- cancel-to-place sleep: 5ms
+
+**crates/extended-bot/src/fill_logger.rs** — fills.jsonl 기록
+- ts, market, side, price, qty, fee, is_maker, realized_pnl
+- fair_price, local_mid, binance_mid, order_to_fill_ms
+- flow_imbalance, depth_imbalance (regression용)
 
 ---
 
@@ -14,198 +136,270 @@
 - **구조**: 하이브리드 off-chain CLOB + StarkNet on-chain settlement
 - **API docs**: https://api.docs.extended.exchange
 - **서버**: AWS Tokyo (ap-northeast-1)
-- **Rate limit**: 1000 req/min (default)
+- **Rate limit**: 1000 req/min (default), 4000/8000/12000 상위 티어
 - **Maker fee**: 0% | Taker fee: 0.025%
-- **Maker rebate**: ≥0.5% market share → 0.002% (현재 미달)
-- **WS 주문 미지원**: REST only
-- **WS 호스트**: `wss://api.starknet.extended.exchange` (NOT app.extended.exchange — UI용은 WAF 차단됨)
+- **Maker rebate**: ≥0.5% market share → 0.002% (현재 미달, 일일 $1.35M 필요)
+- **WS 주문 미지원**: REST only for order/cancel
+- **WS 호스트**: `wss://api.starknet.extended.exchange` (app.extended.exchange는 UI용, WAF 차단됨)
 - **REST 호스트**: `https://api.starknet.extended.exchange`
-- **WS session timeout**: ~15초마다 끊김 → 재연결 필요
+- **WS session timeout**: ~15초마다 끊김 → 자동 재연결
+- **TCP RTT**: 11ms (ELB 포함, 같은 AZ면 0.5ms지만 ELB 경유)
+- **서명**: SNIP12 Poseidon hash + StarkEx ECDSA, domain: Perpetuals/v0/SN_MAIN/1
 
 ### Binance (Reference Price)
-- bookTicker: `wss://fstream.binance.com/ws/{symbol}@bookTicker`
-- aggTrade: `wss://fstream.binance.com/ws/{symbol}@aggTrade`
-- depth20: `wss://fstream.binance.com/ws/{symbol}@depth20@100ms`
-- 심볼 매핑: `TAO-USD` → `taousdt`, `CRCL_24_5-USD` → `crclusdt` (날짜 접미사 제거)
+- bookTicker: `wss://fstream.binance.com/ws/{symbol}@bookTicker` (BBO, 초당 30+회)
+- aggTrade: `wss://fstream.binance.com/ws/{symbol}@aggTrade` (체결, VPIN + trade flow)
+- depth20: `wss://fstream.binance.com/ws/{symbol}@depth20@100ms` (오더북 depth)
+- 심볼 매핑: `TAO-USD` → `taousdt`, `CRCL_24_5-USD` → `crclusdt` (날짜 접미사 자동 제거)
 
 ### 조사한 다른 거래소
 - **gTrade (Gains)**: 오더북 없음(AMM), 수수료 5bps, 온체인 주문 → MM 불가
-- **Reya**: 수수료 4bps (0%가 아님), 100ms 블록, REST/WS API 있음 → x10보다 비쌈
+- **Reya**: 수수료 4bps (검색 결과 0%는 오류), 100ms 블록, REST/WS API → x10보다 비쌈
 
 ---
 
 ## 수익 모델
 
-### 핵심: 스프레드 캡처
+### 핵심: 스프레드 캡처 (Market Making)
 ```
 수익/fill = 캡처 스프레드(bps) - markout 손실(bps)
+캡처 스프레드 ≈ best_price_margin_bps (현재 1.0bps)
 ```
 
-### Fair Value 계산
-```
-fair_price   = binance_mid          (즉시 반응)
-basis_offset = EWMA(x10_mid - binance_mid, alpha=0.01)
-quote_price  = fair_price + basis_offset + flow_shift + depth_shift
-```
-
-### 시그널 (regression R²=0.03 — 효과 미미)
-- **trade flow imbalance**: 바이낸스 aggTrade buy/sell 비율 (sensitivity 0.5bps)
-- **depth imbalance**: 바이낸스 depth20 top 3 level bid/ask 비율 (sensitivity 0.3bps)
-- **VPIN**: 바이낸스 aggTrade 기반 volume-synced informed trading 확률
-
-### Markout 측정
-```
-raw = (future_mid - fill_price) × direction
-adj = raw - binance_market_movement
-```
-- 5개 horizon: 50ms, 200ms, 500ms, 1s, 5s
-- tox_score = max(0, -raw_500ms) + max(0, -adj_5s)
-- feedback_bps → 스프레드 확대에 사용
+### 문제: BTC-USD에서 수익 전환 실패
+- fill당 -$0.005 → 거의 손익분기지만 양수 전환 못 함
+- 원인: informed trader와 같은 RTT(11ms), 시그널 edge 없음 (R²=0.03)
+- 현재: TAO-USD로 이동 (스프레드 넓고 경쟁 적은 마켓)
 
 ---
 
 ## 마켓별 성과 기록
 
-### BTC-USD (1,777 fills)
+### BTC-USD (1,777 fills, 시작 $104)
 - **총 PnL**: -$9.50 (fill당 -$0.005)
-- **5s adj markout**: -1.41bps → -0.34bps (최적화 후)
+- **markout (5s adj)**: -1.41bps → 최적화 후 -0.34bps
 - **win rate**: 10%
-- **결론**: 역선택 심함. informed trader가 같은 RTT(11ms)에서 더 빠른 시그널. fill당 손익분기 근처까지 개선했지만 수익 전환 못 함.
+- **결론**: 역선택 심함. 파라미터 튜닝으로 손익분기 근처까지 개선했지만 수익 전환 못 함
 
 ### WIF-USD (11 fills)
-- **5s adj markout**: -7.91bps
-- **결론**: 유동성 없음. 스프레드 넓은 이유가 있었음. basis ±22bps로 극단적. 즉시 폐기.
+- **markout (5s adj)**: -7.91bps
+- **결론**: 유동성 없어서 역선택 극심. basis ±22bps. 즉시 폐기
 
 ### CRCL_24_5-USD (3 fills)
-- **5s adj markout**: -1.44bps
-- **결론**: V/OI 14.7x로 파머 활동 의심했지만, WS가 CloudFront 차단당함 (잘못된 WS 호스트 사용). 주식 perp라 미국 장 외 유동성 없음.
+- **markout (5s adj)**: -1.44bps
+- **결론**: WS 호스트 잘못 사용(app → api) + 주식 perp 유동성 부족
 
 ### TAO-USD (진행 중)
 - spread 7.6bps, 볼륨 $4.5M, V/OI 4.4x
-- 바이낸스 TAOUSDT vol $675M (reference 안정적)
-- **num_levels=2 → min size reject 문제 발견 → num_levels=1로 수정**
+- 바이낸스 TAOUSDT vol $675M
+- num_levels=2 min size 문제 해결 (자동 스킵), nonce 문제 해결 (timestamp 기반)
 
 ---
 
 ## 레이턴시 (도쿄 EC2)
 
-| 메트릭 | 값 |
-|--------|-----|
-| order_rtt | 7-17ms |
-| cancel_rtt | 5ms |
-| cancel-to-place sleep | 5ms |
-| total requote cycle | ~27ms |
-| TCP RTT to x10 | 11ms (ELB 포함) |
-| binance_age | 0.2-2ms |
-| compute | 0.02ms |
+| 메트릭 | 값 | 설명 |
+|--------|-----|------|
+| order_rtt | 7-17ms | 순수 REST 왕복 |
+| cancel_rtt | 5ms | mass_cancel REST |
+| cancel-to-place sleep | 5ms | cancel 후 대기 |
+| total requote cycle | ~27ms | binance tick → order response |
+| TCP RTT to x10 | 11ms | ELB 포함 |
+| binance_age | 0.2-2ms | BBO tick 나이 |
+| compute | 0.02ms | fair price + spread 계산 |
+
+### 레이턴시 breakdown (debug 로그)
+```
+binance tick → event queue(0.2ms) → orderbook apply(0.02ms) → fair price(0.01ms)
+→ cancel(5ms RTT + 5ms sleep) → spread/skew/quote(0.1ms) → order REST(7-17ms)
+= total ~27ms
+```
 
 ---
 
-## 핵심 버그 기록
+## 필터 & 보호 로직
+
+### Basis filter (active_side == Both일 때만)
+- basis > +3bps → buy 차단 (AskOnly)
+- basis < -2bps → sell 차단 (BidOnly)
+- inventory skew(AskOnly/BidOnly)가 이미 설정됐으면 오버라이드 안 함
+
+### Time filter (11-14 UTC, KST 20-23시)
+- spread에 +2bps 추가 (additive, 곱하기 아님)
+- inventory_spread는 영향 안 받음
+
+### Unwind acceleration
+- 포지션 > 10% inventory ratio → margin = 0 (BBO 최우선)
+- 포지션 없으면 → margin = config 값 (1.0bps)
+
+### Watchdog
+- 60초마다 체크
+- 2분 idle → 경고 로그
+- 3분 idle → emergency mass_cancel + exit(1) → run.sh 재시작
+
+### Circuit breaker
+- daily loss $500 → 봇 정지
+- max_orders_per_minute 300
+- max_errors_per_minute 10
+
+---
+
+## Config 파라미터 설명 (default.toml)
+
+```toml
+[trading]
+market = "TAO-USD"              # 거래 마켓
+order_size_usd = 40.0           # 주문 크기 (USD)
+min_order_usd = 35.0            # 최소 주문 (동적 사이징 하한)
+max_order_usd = 50.0            # 최대 주문 (동적 사이징 상한)
+leverage = 5                    # 거래소 레버리지 (시작 시 자동 설정)
+
+expiry_days = 7                 # 주문 만료 (GTT)
+dead_man_switch_timeout_ms = 60000  # DMS heartbeat 간격
+
+# Fair price
+ewma_alpha = 0.01               # basis_offset EWMA 속도 (느림)
+update_threshold_bps = 3.0       # requote 트리거 threshold
+min_requote_interval_ms = 500    # requote 최소 간격
+
+# Spread
+base_spread_bps = 4.0           # 기본 스프레드
+min_spread_bps = 2.0            # 최소 스프레드
+max_spread_bps = 20.0           # 최대 스프레드
+volatility_sensitivity = 0.5     # vol → spread 가중치
+latency_vol_multiplier = 2.0     # 레이턴시 기반 spread floor
+markout_sensitivity = 0.5        # tox_score → spread 가중치
+
+# Skew
+price_skew_enabled = true
+price_skew_bps = 7.0            # inventory ratio당 skew 강도
+size_skew_enabled = true
+size_skew_factor = 1.0
+min_size_multiplier = 0.2
+max_size_multiplier = 1.8
+emergency_flatten_ratio = 0.8    # 이 이상이면 한쪽 quoting 중단
+
+# VPIN (바이낸스 aggTrade 기반)
+vpin_bucket_volume = 5.0         # 버킷 크기 (TAO 기준)
+vpin_num_buckets = 50            # rolling window
+# 코드: threshold 0.85, sustained_bars 20
+
+# Multi-level quoting
+num_levels = 2                   # 호가 레벨 수
+level_spacing_bps = 3.0          # 레벨 간 간격
+level_size_decay = 0.7           # 레벨별 크기 감소 (자동 min size 체크)
+
+# Fast cancel
+fast_cancel_threshold_bps = 3.0  # 가격 이동 시 즉시 취소
+max_order_age_s = 5.0            # 5초 초과 주문 취소
+
+# Best price tighten
+best_price_tighten_enabled = true
+best_price_margin_bps = 1.0      # BBO에서 이 거리 뒤에 서기
+
+# Trade flow / depth imbalance (regression 최적값)
+trade_flow_sensitivity_bps = 0.5  # flow imbalance → fair price shift
+depth_imbalance_sensitivity_bps = 0.3  # depth imbalance → fair price shift
+
+# Inventory thresholds
+one_side_inventory_ratio = 0.45
+hard_one_side_inventory_ratio = 0.70
+
+[risk]
+max_position_usd = 50.0         # 최대 포지션 (TAO용)
+max_daily_loss_usd = 500.0      # 일일 손실 한도
+max_orders_per_minute = 300
+max_errors_per_minute = 10
+stale_price_s = 5.0
+cooldown_s = 60
+```
+
+---
+
+## 핵심 버그 기록 (실제 손실 유발)
 
 ### BUG-001: Exposure tracker 방향성 미고려 (2026-03-18)
-포지션 줄이는 주문까지 차단 → 포지션 쏠림. 수정: 같은 방향만 차단.
+포지션 줄이는 주문까지 차단. 수정: 같은 방향만 차단.
 
 ### BUG-002: tox_score 부호 반전 (2026-03-18)
-역선택 시 스프레드 축소 → 손실 가속. 수정: 부호 제거.
+역선택 시 스프레드 축소. 수정: `-feedback_bps` → `feedback_bps`.
 
 ### BUG-003: WS 호스트 잘못 사용 (2026-03-27)
 `app.extended.exchange`(UI용) → CloudFront WAF 차단. 수정: `api.starknet.extended.exchange`.
 
 ### BUG-004: Toxic hour spread 곱하기 (2026-03-25)
-VPIN 3x × toxic hour 2x = 6x → fill 불가. 수정: max(VPIN, time)로 변경 후 additive로.
+VPIN 3x × toxic hour 2x = 6x. 수정: additive +2bps.
 
 ### BUG-005: Basis filter가 inventory skew 오버라이드 (2026-03-25)
-Long인데 basis filter가 AskOnly → BidOnly로 전환 → unwind 차단. 수정: active_side==Both일 때만 적용.
+Long인데 basis가 AskOnly→BidOnly 전환. 수정: Both일 때만 적용.
 
-### BUG-006: num_levels=2에서 2nd level min size 미달 (2026-03-28)
-TAO $314 × 0.13 × 0.7(decay) = 0.09 < min 0.1 → reject → consecutive_rejects → 전체 주문 중단. 수정: num_levels=1.
+### BUG-006: num_levels=2 min size 미달 (2026-03-28)
+TAO 2nd level qty < min trade size → reject storm. 수정: size_step×10 미만 자동 스킵.
 
-### BUG-007: consecutive_rejects 10초 영구 백오프 (2026-03-25)
-3+ rejects → 10초 대기 → 또 reject → 무한 루프. 수정: 2초 + 5회 리셋.
+### BUG-007: consecutive_rejects 영구 백오프 (2026-03-25)
+3+ rejects → 10초 무한 루프. 수정: 2초 + 5회 리셋.
 
-### BUG-008: 봇 silent death — WS 재연결 실패 (2026-03-26)
-WS 끊김 → 재연결 실패 → 이벤트 없음 → 봇 6시간 방치. 수정: watchdog 3분 idle → exit(1) + run.sh 자동 재시작.
+### BUG-008: 봇 silent death (2026-03-26)
+WS 끊김 → 6시간 방치. 수정: watchdog 3분 → exit(1) + run.sh 재시작.
 
 ### BUG-009: VPIN sustained toxic 과민 (2026-03-28)
-TAO에서 VPIN 상시 0.7+ → spread 3x 영구 → fill 불가. 수정: threshold 0.7→0.85, bars 8→20.
+TAO VPIN 상시 0.7+ → spread 3x 영구. 수정: threshold 0.85, bars 20.
+
+### BUG-010: Nonce 재시작 중복 (2026-03-28)
+재시작마다 nonce=1 → "Duplicate Order". 수정: unix_timestamp % 1B.
 
 ---
 
-## 시도한 것 & 결과
+## 데이터 분석 결과 (BTC-USD 1,777 fills)
 
-### 효과 있었던 것
-- EC2 도쿄 이전: RTT 40ms→11ms
-- cancel 대기 50ms→5ms: cycle 72ms→27ms
-- WS 호스트 수정: CloudFront 차단 해결
-- best_price_margin 1.0bps: 캡처 스프레드 확보
-- toxic hour additive spread: 포지션 unwind 가능하게
-- unwind margin 0: 포지션 보유 시간 단축
-- basis filter: worst fill 제거
+### 시간대별 markout
+- 06-08 UTC: adj -0.77bps, win 15-20% ← 최선
+- 11-14 UTC: adj -1.7bps, win 7% ← 최악
 
-### 효과 없었던 것
-- trade flow imbalance (R²=0.03)
-- depth imbalance (계수 0.03)
-- sell 비대칭 스프레드 (sell 안 팔림)
-- VPIN sustained toxic (TAO에서 과민반응)
-- 다른 마켓 이동 (WIF, CRCL — 각각 문제 있었음)
+### order_to_fill vs markout
+- <100ms fill: adj -1.68bps, win 4% ← 빠른 fill = informed trader
+- 2s-10s fill: adj -1.07bps, win 14% ← 느린 fill = 일반 trader
+
+### basis vs markout
+- basis 0~2bps: adj -1.02bps ← 가장 나음
+- basis >5bps + buy: adj -3.10bps ← 최악
+
+### buy vs sell
+- sell이 buy보다 1.44bps 나쁨 (regression)
+
+### Regression (R²=0.03, 효과 미미)
+- flow_imbalance: 최적 0.18bps (현재 0.5)
+- depth_imbalance: 최적 0.11bps (현재 0.3)
+- 결론: flow/depth 시그널이 이 환경에서 예측력 없음
 
 ---
 
 ## 참고 자료 & 학습
 
-### 읽은 글
-- Quant Roadmap: fair value, spread, skew 기본
-- beatzxbt/smm: Bollinger Band spread, inventory extreme, 2단계 주문 크기
-- gamma-ray: Avellaneda-Stoikov 모델 (reservation price + optimal spread)
-- VisualHFT: VPIN 계산, LOB imbalance, Market Resilience
-- VPIN 글: sustained elevated (8+ bars) 시그널, LOB multi-level
-- HFT Advisory: $0+ strategy, LOB architecture, order placement
-- Liquidity Goblin 팟캐스트: "올바른 테이블에 앉아라", "좋은 다리만 하라", funding rate 캐리
-- MM 리서치 논문: PULSE 알고리즘, 다중 거래소 리드-래그, VAMP
-
 ### 핵심 교훈
 1. **"올바른 테이블"이 실력보다 중요** — BTC-USD는 프로 테이블
-2. **속도 경쟁 이길 수 없으면 피해라** — 11ms RTT는 변경 불가
-3. **파라미터 튜닝은 한계 있음** — edge 없으면 ±$0 맴돎
-4. **flow/depth 시그널은 이 환경에서 효과 없음** — R²=0.03
-5. **min order size 등 마켓별 제약 반드시 확인** — TAO num_levels=2 문제
-6. **WS 호스트 확인** — API vs UI 엔드포인트 구분 필수
+2. **속도 경쟁 이길 수 없으면 피해라** — 11ms RTT 변경 불가
+3. **파라미터 튜닝은 한계** — edge 없으면 ±$0 맴돎
+4. **마켓별 제약 반드시 확인** — min order size, tick size, VPIN 특성
+5. **WS 호스트 구분** — API vs UI 엔드포인트
+6. **봇 재시작 전 반드시 --close + 확인** — 포지션 쌓임 방지
+
+### 읽은 글 & 참고
+- Quant Roadmap: fair value fitting, SVI, regressions, Wing Model
+- beatzxbt/smm: Bollinger Band spread, 2단계 주문, inventory extreme
+- gamma-ray: Avellaneda-Stoikov (reservation price + optimal spread)
+- VisualHFT: VPIN, LOB imbalance, Market Resilience 구현
+- HFT Advisory: VPIN sustained, LOB multi-level, order placement
+- Liquidity Goblin 팟캐스트: 올바른 테이블, 좋은 다리, funding rate, 포인트 파머
+- 0xDub: kernel tuning, rust channel benchmark
+- MM 리서치 논문: PULSE, 다중 거래소 리드-래그, VAMP
 
 ---
 
-## 현재 Config (TAO-USD)
-```toml
-market = "TAO-USD"
-order_size_usd = 40.0
-min_order_usd = 35.0
-max_order_usd = 50.0
-leverage = 5
-base_spread_bps = 4.0
-min_spread_bps = 2.0
-best_price_tighten_enabled = true
-best_price_margin_bps = 1.0
-num_levels = 1
-trade_flow_sensitivity_bps = 0.5
-depth_imbalance_sensitivity_bps = 0.3
-max_position_usd = 50.0
-vpin_bucket_volume = 5.0
-vpin_num_buckets = 50
-# VPIN threshold: 0.85, sustained_bars: 20
-```
-
-## Infra
-- **EC2**: 54.199.221.223 (ap-northeast-1, t2.small)
-- **SSH**: `ssh -i extendedMM.pem ec2-user@54.199.221.223`
-- **Bot path**: `~/extendedMM/target/release/extended-mm`
-- **Auto-restart**: `run.sh` (nohup wrapper)
-- **Watchdog**: 3분 idle → exit(1) → run.sh 재시작
-- **GitHub**: https://github.com/ArasakaCorporation2077/extendedbot.git (private)
-
 ## TODO
-- [ ] TAO fill 200개 모아서 markout 분석
-- [ ] regression 재실행 (flow/depth 포함 데이터)
-- [ ] 포지션 보유 시간 분석 (1s markout 양수인데 5s 음수 — 빨리 팔면 수익)
-- [ ] Reya 거래소 프로토타입 (수수료 높지만 공평한 속도)
-- [ ] 포인트 파머 패턴 감지 로직
+- [ ] TAO-USD fill 200개 모아서 markout 분석
+- [ ] regression 재실행 (flow/depth 포함)
+- [ ] 포인트 파머 패턴 감지
 - [ ] funding rate 캐리 전략 결합
+- [ ] Reya 거래소 프로토타입
+- [ ] 멀티마켓 동시 운영 (config만 바꿔서)
