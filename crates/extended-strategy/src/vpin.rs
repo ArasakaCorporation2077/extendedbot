@@ -33,8 +33,8 @@ impl VpinCalculator {
             current_total: Decimal::ZERO,
             cached_vpin: Decimal::ZERO,
             consecutive_elevated: 0,
-            elevated_threshold: dec!(0.7),
-            sustained_bars: 8,
+            elevated_threshold: dec!(0.85),
+            sustained_bars: 20,
         }
     }
 

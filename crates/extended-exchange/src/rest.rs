@@ -54,7 +54,13 @@ impl ExtendedRestClient {
             user_agent: config.user_agent.clone(),
             signer,
             rate_limiter: Arc::new(RateLimiter::default_extended()),
-            nonce_counter: Arc::new(AtomicU32::new(1)),
+            // Start nonce from unix timestamp to avoid "Duplicate Order" on restart.
+            nonce_counter: Arc::new(AtomicU32::new(
+                (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() % 1_000_000_000) as u32
+            )),
             market_config: parking_lot::RwLock::new(None),
         }
     }

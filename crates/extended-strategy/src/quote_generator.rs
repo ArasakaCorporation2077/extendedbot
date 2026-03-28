@@ -134,7 +134,9 @@ impl QuoteGenerator {
                     base_order_size * decay * input.skew.bid_size_mult,
                     self.size_step,
                 );
-                if bid_size > Decimal::ZERO && bid_price > Decimal::ZERO {
+                // Skip if size below estimated min (size_step × 10) to avoid "less than min trade size" rejects
+                let min_qty = self.size_step * dec!(10);
+                if bid_size >= min_qty && bid_price > Decimal::ZERO {
                     bids.push(QuoteLevel { side: Side::Buy, price: bid_price, size: bid_size, level: level as u32 });
                 }
             }
@@ -150,7 +152,8 @@ impl QuoteGenerator {
                     base_order_size * decay * input.skew.ask_size_mult,
                     self.size_step,
                 );
-                if ask_size > Decimal::ZERO && ask_price > Decimal::ZERO {
+                let min_qty = self.size_step * dec!(10);
+                if ask_size >= min_qty && ask_price > Decimal::ZERO {
                     asks.push(QuoteLevel { side: Side::Sell, price: ask_price, size: ask_size, level: level as u32 });
                 }
             }
