@@ -18,7 +18,7 @@ dead_man_switch_timeout_ms = 60000
 
 # Fair price
 ewma_alpha = 0.01
-update_threshold_bps = 10.0
+update_threshold_bps = 3.0
 min_requote_interval_ms = 100
 
 # Spread
