@@ -596,14 +596,17 @@ impl MarketBot {
 
         // Basis filter: block the side that loses when basis is extreme.
         // ONLY applies when active_side is Both — never override inventory skew.
-        // Inventory skew (AskOnly/BidOnly) is for unwinding positions and must take priority.
+        // FIX: Use x10_mid vs binance_mid (not quote_price which includes basis_offset).
         let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
-        if active_side == ActiveSide::Both && !bn_mid.is_zero() && !fair_price.is_zero() {
-            let basis_bps = ((fair_price - bn_mid) / bn_mid) * dec!(10000);
+        let x10_mid = self.state.orderbook.mid().unwrap_or(Decimal::ZERO);
+        if active_side == ActiveSide::Both && !bn_mid.is_zero() && !x10_mid.is_zero() {
+            let basis_bps = ((x10_mid - bn_mid) / bn_mid) * dec!(10000);
             if basis_bps > dec!(3) {
+                info!(basis_bps = %basis_bps, "Basis filter → AskOnly");
                 active_side = ActiveSide::AskOnly;
             }
             if basis_bps < dec!(-2) {
+                info!(basis_bps = %basis_bps, "Basis filter → BidOnly");
                 active_side = ActiveSide::BidOnly;
             }
         }
@@ -665,6 +668,16 @@ impl MarketBot {
 
         let quotes = self.quote_gen.generate(&input);
 
+        info!(
+            bids = quotes.bids.len(),
+            asks = quotes.asks.len(),
+            reduce_only = quotes.reduce_only,
+            active_side = ?active_side,
+            inventory_ratio = %inventory_ratio,
+            base_size = %base_size,
+            "Quote generation result"
+        );
+
         // Diff current orders vs desired quotes and send changes
         let t0 = Instant::now();
         self.apply_quotes(&market, &quotes, tick_time).await;
@@ -678,11 +691,14 @@ impl MarketBot {
 
     async fn apply_quotes(&mut self, market: &str, quotes: &GeneratedQuotes, tick_time: Instant) {
         // Cancels already fired in cancel_all_live() before quote pipeline.
-        // P0-3 FIX: Build order requests synchronously with cumulative exposure tracking
-        // to prevent race condition where multiple orders pass individual checks
-        // but together exceed limits.
         let mut order_reqs = Vec::new();
         let mut batch_exposure_usd = Decimal::ZERO;
+
+        let total_quotes = quotes.bids.len() + quotes.asks.len();
+        if total_quotes == 0 {
+            info!("apply_quotes: no quotes generated, skipping");
+            return;
+        }
 
         for quote in quotes.bids.iter().map(|q| (Side::Buy, q)).chain(quotes.asks.iter().map(|q| (Side::Sell, q))) {
             if let Some(req) = self.prepare_order_with_batch_exposure(
@@ -694,8 +710,22 @@ impl MarketBot {
                 &mut batch_exposure_usd,
             ) {
                 order_reqs.push(req);
+            } else {
+                info!(
+                    side = %quote.0,
+                    price = %quote.1.price,
+                    size = %quote.1.size,
+                    "Order blocked by risk limits"
+                );
             }
         }
+
+        info!(
+            prepared = order_reqs.len(),
+            total_quotes = total_quotes,
+            batch_exposure = %batch_exposure_usd,
+            "apply_quotes: orders prepared"
+        );
 
         // Send all orders in parallel
         if !order_reqs.is_empty() {
