@@ -848,21 +848,18 @@ impl MarketBot {
             let (bid_exp, ask_exp) = self.state.order_tracker.pending_exposure(market, mark);
             self.state.exposure_tracker.update_pending_orders(market, bid_exp, ask_exp);
 
-            // Check worst-case exposure INCLUDING this order AND all previously prepared orders in this batch.
-            // worst_case already accounts for direction via max(|pos+bids|, |pos-asks|).
-            // An order INCREASES worst-case only if it goes in the same direction as the dominant exposure side.
-            // - LONG position dominant: BUY increases it, SELL reduces it → only BUY contributes to batch
-            // - SHORT position dominant: SELL increases it, BUY reduces it → only SELL contributes to batch
+            // Worst-case exposure = max(|pos + all_bids|, |pos - all_asks|).
+            // For MM with bid+ask, worst case is ONE side, not both.
+            // batch_exposure tracks the LARGER side only.
             let order_notional = qty * price;
             let worst_case = self.state.exposure_tracker.worst_case_exposure_usd();
             let net_position = self.state.exposure_tracker.net_exposure_usd();
-            // Order increases exposure if same direction as net position (or net=0, both sides add exposure)
             let increases_exposure = if net_position > Decimal::ZERO {
                 is_buy
             } else if net_position < Decimal::ZERO {
                 !is_buy
             } else {
-                true // flat: both directions add exposure
+                is_buy // flat: only count buy side (symmetric, just pick one)
             };
             let batch_contribution = if increases_exposure { *batch_exposure_usd + order_notional } else { Decimal::ZERO };
             if worst_case + batch_contribution > self.state.exposure_tracker.max_total_usd() {
