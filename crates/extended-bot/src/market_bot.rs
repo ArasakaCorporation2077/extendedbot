@@ -351,22 +351,18 @@ impl MarketBot {
             _ => dec!(9999), // No previous quote → force requote
         };
 
-        // Backoff interval when orders keep failing (balance insufficient etc.)
-        // Cap at 2s to avoid getting stuck. Reset after 5 consecutive rejects.
-        let effective_interval = if self.consecutive_rejects >= 5 {
-            self.consecutive_rejects = 0; // Reset to retry
-            min_interval
+        // Event-driven requote: trigger when price moves enough or orders are missing.
+        // No fixed timer — converge handles "leave unchanged orders alone" internally.
+        // Backoff only on consecutive rejects to avoid hammering a broken state.
+        let min_interval = if self.consecutive_rejects >= 5 {
+            self.consecutive_rejects = 0;
+            Duration::from_millis(500)
         } else if self.consecutive_rejects >= 3 {
             Duration::from_secs(2)
-        } else if !has_live_orders && self.last_quoted_fp.is_some() {
-            Duration::from_secs(1)
         } else {
-            min_interval
+            Duration::from_millis(100) // minimal debounce to avoid spinning
         };
-        // After a fill, last_quoted_fp is set to None → price_change = 9999.
-        // Bypass the interval gate in that case to replenish the filled side quickly.
-        let fill_urgent = self.last_quoted_fp.is_none();
-        let should_requote = (fill_urgent || self.last_requote.elapsed() >= effective_interval)
+        let should_requote = self.last_requote.elapsed() >= min_interval
             && (price_change >= threshold || !has_live_orders);
 
         // Fast cancel check when NOT requoting (stale/aged orders).

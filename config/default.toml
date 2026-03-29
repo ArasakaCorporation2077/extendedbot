@@ -18,8 +18,8 @@ dead_man_switch_timeout_ms = 60000
 
 # Fair price
 ewma_alpha = 0.01
-update_threshold_bps = 5.0
-min_requote_interval_ms = 2000
+update_threshold_bps = 10.0
+min_requote_interval_ms = 100
 
 # Spread
 base_spread_bps = 4.0
@@ -50,7 +50,7 @@ level_size_decay = 0.7
 
 # Fast cancel
 fast_cancel_threshold_bps = 3.0
-max_order_age_s = 15.0
+max_order_age_s = 300.0
 
 # Best price tighten
 best_price_tighten_enabled = true
