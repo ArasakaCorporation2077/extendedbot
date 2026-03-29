@@ -19,7 +19,7 @@ dead_man_switch_timeout_ms = 60000
 # Fair price
 ewma_alpha = 0.01
 update_threshold_bps = 3.0
-min_requote_interval_ms = 500
+min_requote_interval_ms = 100
 
 # Spread
 base_spread_bps = 4.0
@@ -63,6 +63,11 @@ close_spread_bps = 4.0
 # Trade flow / depth imbalance (regression-optimized from 1,427 fills)
 trade_flow_sensitivity_bps = 0.5
 depth_imbalance_sensitivity_bps = 0.3
+
+# ROC guard — pause quoting when price moves too fast
+roc_window_ms = 10000         # 10s rolling window
+roc_threshold_bps = 30.0      # 30bps move triggers pause
+roc_pause_ms = 15000          # 15s pause after trigger
 
 # Inventory thresholds
 one_side_inventory_ratio = 0.45
