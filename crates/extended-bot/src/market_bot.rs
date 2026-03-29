@@ -270,9 +270,18 @@ impl MarketBot {
                 self.last_quoted_fp = None;
             }
             BotEvent::PositionUpdate { market, size, entry_price, mark_price, .. } => {
-                self.state.position_manager.set_position(&market, size, entry_price, mark_price);
-                let notional = size.abs() * mark_price;
-                self.state.exposure_tracker.update_position(&market, notional * size.signum());
+                if market.is_empty() {
+                    // Empty market = "all positions closed" from WS empty snapshot.
+                    // Reset our market's position to flat.
+                    let m = self.state.market().to_string();
+                    self.state.position_manager.set_position(&m, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+                    self.state.exposure_tracker.update_position(&m, Decimal::ZERO);
+                    info!("Position reset to flat (empty WS snapshot)");
+                } else {
+                    self.state.position_manager.set_position(&market, size, entry_price, mark_price);
+                    let notional = size.abs() * mark_price;
+                    self.state.exposure_tracker.update_position(&market, notional * size.signum());
+                }
             }
             BotEvent::BalanceUpdate { available, total_equity, .. } => {
                 *self.state.equity.write() = total_equity;

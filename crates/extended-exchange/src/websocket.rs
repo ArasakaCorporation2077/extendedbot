@@ -388,8 +388,17 @@ impl ExtendedWebSocket {
                 }
 
                 if let Some(positions) = wrapper.positions {
-                    if msg_type == "SNAPSHOT" && positions.is_empty() {
-                        warn!("Ignoring empty position snapshot");
+                    if positions.is_empty() {
+                        // Empty positions = all positions closed. Send a zero-size
+                        // update for a generic market — the bot will clear its state.
+                        let _ = event_tx.send(BotEvent::PositionUpdate {
+                            market: String::new(), // empty = "all markets flat"
+                            size: rust_decimal::Decimal::ZERO,
+                            entry_price: rust_decimal::Decimal::ZERO,
+                            mark_price: rust_decimal::Decimal::ZERO,
+                            unrealized_pnl: rust_decimal::Decimal::ZERO,
+                            ts: 0,
+                        });
                     } else {
                         for pos in positions {
                             let signed_size = match pos.side.as_deref() {
