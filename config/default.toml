@@ -7,9 +7,9 @@ user_agent = "extended-mm/0.1.0"
 
 [trading]
 market = "ETH-USD"
-order_size_usd = 10.0
-min_order_usd = 10.0
-max_order_usd = 15.0
+order_size_usd = 25.0
+min_order_usd = 20.0
+max_order_usd = 30.0
 leverage = 5
 
 # Expiry: mainnet supports up to 90 days
@@ -44,7 +44,7 @@ vpin_bucket_volume = 50.0
 vpin_num_buckets = 50
 
 # Multi-level quoting
-num_levels = 2
+num_levels = 1
 level_spacing_bps = 3.0
 level_size_decay = 0.7
 
