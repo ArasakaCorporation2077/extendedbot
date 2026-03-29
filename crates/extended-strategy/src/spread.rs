@@ -21,8 +21,6 @@ pub struct SpreadInput {
     pub latency_vol_bps: Decimal,
     pub markout_adj_bps: Decimal,
     pub caf_multiplier: Decimal,
-    /// Extra spread from WS feed delay (stale data = widen spread).
-    pub ws_delay_bps: Decimal,
 }
 
 impl Default for SpreadInput {
@@ -35,7 +33,6 @@ impl Default for SpreadInput {
             latency_vol_bps: Decimal::ZERO,
             markout_adj_bps: Decimal::ZERO,
             caf_multiplier: Decimal::ONE,
-            ws_delay_bps: Decimal::ZERO,
         }
     }
 }
@@ -65,7 +62,7 @@ impl SpreadCalculator {
         let inventory_spread = input.inventory_ratio.abs() * dec!(2.0);
         let markout_adj = input.markout_adj_bps * self.markout_sensitivity;
         let latency_floor = input.latency_vol_bps * self.latency_vol_multiplier;
-        let raw_spread = (base_spread + inventory_spread + markout_adj + input.ws_delay_bps).max(latency_floor);
+        let raw_spread = (base_spread + inventory_spread + markout_adj).max(latency_floor);
         let raw_spread = raw_spread * input.caf_multiplier;
         let clamped_bps = clamp(raw_spread, self.min_spread_bps, self.max_spread_bps);
         let half_spread = bps_to_ratio(clamped_bps) / dec!(2);

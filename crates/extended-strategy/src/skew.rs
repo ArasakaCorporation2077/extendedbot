@@ -1,10 +1,8 @@
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use rand::Rng;
 use extended_types::decimal_utils::{bps_to_ratio, clamp};
 
 /// Inventory-based price and size skew with nonlinear response.
-/// Adds small random noise to prevent skew sniffers from reading our inventory.
 pub struct SkewCalculator {
     pub price_skew_enabled: bool,
     pub price_skew_bps: Decimal,
@@ -13,8 +11,6 @@ pub struct SkewCalculator {
     pub min_size_multiplier: Decimal,
     pub max_size_multiplier: Decimal,
     pub emergency_threshold: Decimal,
-    /// Fraction of skew to randomize (e.g. 0.15 = ±15%).
-    pub noise_fraction: Decimal,
 }
 
 pub struct SkewResult {
@@ -42,7 +38,6 @@ impl SkewCalculator {
             min_size_multiplier,
             max_size_multiplier,
             emergency_threshold,
-            noise_fraction: dec!(0.15), // ±15% noise on skew
         }
     }
 
@@ -53,19 +48,10 @@ impl SkewCalculator {
 
         let (bid_price_offset, ask_price_offset) = if self.price_skew_enabled {
             let skew = bps_to_ratio(self.price_skew_bps) * nonlinear_ratio * mid_price;
-            // Add noise to prevent skew sniffers from reading our inventory.
-            // Uniform random in [-noise_fraction, +noise_fraction] of skew magnitude.
-            let noisy_skew = if !skew.is_zero() && !self.noise_fraction.is_zero() {
-                let noise_f64: f64 = rand::thread_rng().gen_range(-1.0..1.0);
-                let noise = Decimal::try_from(noise_f64).unwrap_or(Decimal::ZERO) * self.noise_fraction * skew.abs();
-                skew + noise
-            } else {
-                skew
-            };
             // Reservation price shift (Avellaneda-Stoikov):
             // Long → skew>0 → shift both quotes down → bid lower (buy less), ask lower (sell easier)
             // Short → skew<0 → shift both quotes up → bid higher (buy easier), ask higher (sell less)
-            (-noisy_skew, -noisy_skew)
+            (-skew, -skew)
         } else {
             (Decimal::ZERO, Decimal::ZERO)
         };

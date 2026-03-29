@@ -8,4 +8,3 @@ extended-types = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tracing = { workspace = true }
-rand = { workspace = true }

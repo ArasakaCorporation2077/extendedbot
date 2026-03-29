@@ -149,17 +149,6 @@ pub struct TradingConfig {
     /// Max fair-price shift in bps when depth imbalance = 1.0 (default 1.5).
     #[serde(default = "default_depth_imbalance_sensitivity")]
     pub depth_imbalance_sensitivity_bps: f64,
-
-    // ROC guard — pause quoting on fast price moves
-    /// Rolling window in ms to measure price change (default 10000 = 10s).
-    #[serde(default = "default_roc_window")]
-    pub roc_window_ms: u64,
-    /// Trigger threshold in bps (default 30.0).
-    #[serde(default = "default_roc_threshold")]
-    pub roc_threshold_bps: f64,
-    /// Pause duration in ms after trigger (default 15000 = 15s).
-    #[serde(default = "default_roc_pause")]
-    pub roc_pause_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -215,9 +204,6 @@ fn default_hard_one_side_ratio() -> f64 { 0.70 }
 fn default_trade_flow_window() -> f64 { 5.0 }
 fn default_trade_flow_sensitivity() -> f64 { 1.0 }
 fn default_depth_imbalance_sensitivity() -> f64 { 1.5 }
-fn default_roc_window() -> u64 { 10_000 }
-fn default_roc_threshold() -> f64 { 30.0 }
-fn default_roc_pause() -> u64 { 15_000 }
 fn default_max_daily_loss() -> Decimal { Decimal::new(500, 0) }
 fn default_max_orders_per_min() -> u32 { 200 }
 fn default_max_errors_per_min() -> u32 { 10 }

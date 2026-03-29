@@ -10,7 +10,6 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use extended_risk::fast_cancel::{FastCancel, LiveOrderInfo};
-use extended_risk::RocGuard;
 use extended_strategy::depth_imbalance::DepthImbalanceTracker;
 use extended_strategy::fair_price::FairPriceCalculator;
 use extended_strategy::quote_generator::{ActiveSide, GeneratedQuotes, QuoteGenerator, QuoteInput};
@@ -84,7 +83,6 @@ pub struct MarketBot {
     trade_flow: TradeFlowTracker,
     depth_imbalance: DepthImbalanceTracker,
     fast_cancel: FastCancel,
-    roc_guard: RocGuard,
     last_requote: Instant,
     last_fast_cancel: Option<Instant>,
     last_binance_tick: Option<Instant>,
@@ -93,8 +91,6 @@ pub struct MarketBot {
     last_depth_imbalance: f64,
     consecutive_rejects: u32,
     order_seq: u64,
-    /// Set by on_fill() to force an immediate requote on the next event.
-    fill_requires_requote: bool,
 }
 
 impl MarketBot {
@@ -151,12 +147,6 @@ impl MarketBot {
             tc.max_order_age_s,
         );
 
-        let roc_guard = RocGuard::new(
-            tc.roc_window_ms,
-            tc.roc_threshold_bps,
-            tc.roc_pause_ms,
-        );
-
         Self {
             state,
             fair_price_calc,
@@ -168,7 +158,6 @@ impl MarketBot {
             trade_flow,
             depth_imbalance,
             fast_cancel,
-            roc_guard,
             last_requote: Instant::now(),
             last_fast_cancel: None,
             last_binance_tick: None,
@@ -177,7 +166,6 @@ impl MarketBot {
             last_depth_imbalance: 0.0,
             consecutive_rejects: 0,
             order_seq: 0,
-            fill_requires_requote: false,
         }
     }
 
@@ -212,35 +200,6 @@ impl MarketBot {
                 *self.state.binance_mid.write() = Some(binance_mid);
                 self.fair_price_calc.update_reference_mid(binance_mid);
                 self.vol_estimator.on_trade(binance_mid);
-                self.roc_guard.on_price(binance_mid);
-
-                // Binance-triggered requote: if Binance moved significantly from
-                // our last quoted price, trigger an immediate requote without waiting
-                // for the next x10 orderbook update (which may lag 50-200ms).
-                let threshold = Decimal::try_from(self.state.config.trading.update_threshold_bps).unwrap_or(dec!(3.0));
-                let min_interval = Duration::from_millis(self.state.config.trading.min_requote_interval_ms);
-                let price_moved = match self.last_quoted_fp {
-                    Some(prev) if !prev.is_zero() => ((binance_mid - prev).abs() / prev) * dec!(10000) >= threshold,
-                    _ => false,
-                };
-                if price_moved && self.last_requote.elapsed() >= min_interval && !self.roc_guard.is_paused() {
-                    let tc = &self.state.config.trading;
-                    let flow_sensitivity = Decimal::try_from(tc.trade_flow_sensitivity_bps).unwrap_or(dec!(1.0));
-                    let flow_shift_bps = self.trade_flow.imbalance() * flow_sensitivity;
-                    let flow_shift_price = TradeFlowTracker::bps_to_price_shift(flow_shift_bps, binance_mid);
-                    let depth_shift_bps = self.depth_imbalance.shift_bps(tc.depth_imbalance_sensitivity_bps);
-                    let depth_shift_price = TradeFlowTracker::bps_to_price_shift(depth_shift_bps, binance_mid);
-                    let base_quote_price = self.fair_price_calc.quote_price().unwrap_or(binance_mid);
-                    let quote_price = base_quote_price + flow_shift_price + depth_shift_price;
-
-                    // No cancel_all_live here — requote → apply_quotes uses cancel-replace.
-                    debug!(
-                        binance_mid = %binance_mid,
-                        quote_price = %quote_price,
-                        "Binance-triggered requote"
-                    );
-                    self.requote(quote_price, received_at).await;
-                }
             }
             BotEvent::BinanceTrade { qty, is_buyer_maker, received_at, .. } => {
                 // VPIN from Binance trades — much faster signal than x10
@@ -299,10 +258,6 @@ impl MarketBot {
                 // P0-7 FIX: Markout recording moved to on_order_update (FILLED status)
                 // to avoid double-counting. Fill events are unreliable on x10.
                 self.on_fill(&resolved_ext_id, price, qty, fee, is_maker);
-
-                // Fill-triggered requote: force immediate requote to update quotes
-                // with new inventory position. Don't wait for the next orderbook tick.
-                self.fill_requires_requote = true;
             }
             BotEvent::PositionUpdate { market, size, entry_price, mark_price, .. } => {
                 self.state.position_manager.set_position(&market, size, entry_price, mark_price);
@@ -374,7 +329,7 @@ impl MarketBot {
             Some(fp) => fp,
             None => return,
         };
-        let _compute_us = t0.elapsed().as_micros();
+        let compute_us = t0.elapsed().as_micros();
 
         let min_interval = Duration::from_millis(self.state.config.trading.min_requote_interval_ms);
         let threshold = Decimal::try_from(self.state.config.trading.update_threshold_bps).unwrap_or(dec!(3.0));
@@ -398,26 +353,21 @@ impl MarketBot {
         } else {
             min_interval
         };
-        // Force requote after fill — inventory changed, quotes are stale.
-        let fill_urgent = self.fill_requires_requote;
-        if fill_urgent {
-            self.fill_requires_requote = false;
-        }
-        let should_requote = fill_urgent || (self.last_requote.elapsed() >= effective_interval && (price_change >= threshold || !has_live_orders));
+        let should_requote = self.last_requote.elapsed() >= effective_interval && (price_change >= threshold || !has_live_orders);
 
-        // ROC guard: if price is moving too fast, cancel all and don't requote.
-        if self.roc_guard.is_paused() {
-            if has_live_orders {
-                info!(roc_bps = %self.roc_guard.current_roc_bps(), "ROC guard — cancelling all orders");
-                self.cancel_all_live(tick_time).await;
-            }
-            return;
-        }
-
-        // Cancel all live orders before requoting, then place fresh quotes.
-        // TODO: Re-enable cancel-replace after live testing confirms x10 cancelId works.
+        // Cancel IMMEDIATELY — before any non-critical computation
         if should_requote && has_live_orders {
+            let pre_cancel = t0.elapsed().as_micros();
             self.cancel_all_live(tick_time).await;
+            let post_cancel = t0.elapsed().as_micros();
+            debug!(
+                binance_age_us = binance_age_us as u64,
+                compute_us = compute_us as u64,
+                pre_cancel_us = pre_cancel as u64,
+                cancel_us = (post_cancel - pre_cancel) as u64,
+                total_us = post_cancel as u64,
+                "Latency breakdown: binance_tick_age → compute → cancel"
+            );
         } else if has_live_orders {
             self.check_fast_cancel(fp, tick_time).await;
         }
@@ -514,8 +464,9 @@ impl MarketBot {
                     );
                 }
 
-                // No sleep needed: REST ACK confirms exchange received the cancel.
-                // Network transit of the next order (~7ms) provides implicit delay.
+                // Brief pause so the exchange has time to process the cancel before
+                // new orders arrive. 5ms is sufficient for same-region (Tokyo→Tokyo).
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
             Err(e) => {
                 warn!(error = %e, "Mass cancel failed");
@@ -527,9 +478,9 @@ impl MarketBot {
     async fn check_fast_cancel(&mut self, fair_price: Decimal, tick_time: Instant) {
         if self.state.smoke_mode { return; }
 
-        // Debounce: fast cancel은 최소 200ms 간격으로만
+        // Debounce: fast cancel은 최소 1초 간격으로만
         if let Some(last) = self.last_fast_cancel {
-            if last.elapsed() < Duration::from_millis(200) {
+            if last.elapsed() < Duration::from_millis(1000) {
                 return;
             }
         }
@@ -588,10 +539,7 @@ impl MarketBot {
         if self.state.smoke_mode { return; }
         if !self.state.circuit_breaker.is_trading_allowed() {
             debug!("Circuit breaker active, skipping requote");
-            return;
-        }
-        if self.roc_guard.is_paused() {
-            debug!(roc_bps = %self.roc_guard.current_roc_bps(), "ROC guard active, skipping requote");
+
             return;
         }
 
@@ -621,19 +569,6 @@ impl MarketBot {
             _ => Decimal::ZERO,
         };
 
-        // WS feed delay → spread widening.
-        // If Binance BBO is stale (>10ms), data is unreliable → widen spread.
-        let ws_delay_bps = match self.last_binance_tick {
-            Some(t) => {
-                let age_ms = t.elapsed().as_millis() as u64;
-                if age_ms > 50 { dec!(3.0) }      // >50ms: very stale
-                else if age_ms > 20 { dec!(1.5) }  // >20ms: moderately stale
-                else if age_ms > 10 { dec!(0.5) }  // >10ms: slightly stale
-                else { Decimal::ZERO }
-            }
-            None => dec!(3.0), // no Binance data at all
-        };
-
         let spread_input = SpreadInput {
             volatility_bps,
             vpin_multiplier: vpin_mult,
@@ -643,7 +578,6 @@ impl MarketBot {
             // tox_score is positive when adverse → directly widens spread
             markout_adj_bps: self.state.markout.feedback_bps(self.state.market()),
             caf_multiplier: Decimal::ONE,
-            ws_delay_bps,
         };
         let spread = self.spread_calc.calculate(&spread_input);
 
@@ -663,12 +597,9 @@ impl MarketBot {
         // Basis filter: block the side that loses when basis is extreme.
         // ONLY applies when active_side is Both — never override inventory skew.
         // Inventory skew (AskOnly/BidOnly) is for unwinding positions and must take priority.
-        // FIX: Use raw fair_price (binance_mid), NOT quote_price which includes
-        // basis_offset + flow_shift + depth_shift — those caused double-counting.
         let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
-        let x10_mid = self.state.orderbook.mid().unwrap_or(Decimal::ZERO);
-        if active_side == ActiveSide::Both && !bn_mid.is_zero() && !x10_mid.is_zero() {
-            let basis_bps = ((x10_mid - bn_mid) / bn_mid) * dec!(10000);
+        if active_side == ActiveSide::Both && !bn_mid.is_zero() && !fair_price.is_zero() {
+            let basis_bps = ((fair_price - bn_mid) / bn_mid) * dec!(10000);
             if basis_bps > dec!(3) {
                 active_side = ActiveSide::AskOnly;
             }
@@ -747,7 +678,9 @@ impl MarketBot {
 
     async fn apply_quotes(&mut self, market: &str, quotes: &GeneratedQuotes, tick_time: Instant) {
         // Cancels already fired in cancel_all_live() before quote pipeline.
-        // TODO: Re-enable cancel-replace after live testing confirms x10 cancelId works.
+        // P0-3 FIX: Build order requests synchronously with cumulative exposure tracking
+        // to prevent race condition where multiple orders pass individual checks
+        // but together exceed limits.
         let mut order_reqs = Vec::new();
         let mut batch_exposure_usd = Decimal::ZERO;
 
