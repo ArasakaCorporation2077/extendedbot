@@ -993,6 +993,31 @@ impl MarketBot {
                             let rtt = t0.elapsed().as_micros() as u64;
                             state.latency.record_order_rtt(rtt);
                             state.latency.record_tick_to_trade(tick_time.elapsed().as_micros() as u64);
+
+                            // If cancel-replace failed (e.g. "Edit order not found"),
+                            // retry without cancel_id as a plain new order.
+                            if old_cancel_id.is_some() {
+                                warn!(error = %e, id = %external_id, "converge: cancel-replace failed, retrying as new order");
+                                // Mark old order as cancelled in tracker (it's gone from exchange)
+                                if let Some(old_eid) = &old_cancel_id {
+                                    if let Some(old_ext) = state.order_tracker.resolve_exchange_id(old_eid) {
+                                        state.order_tracker.on_status_update(
+                                            &old_ext, OrderStatus::Cancelled, None, None, None, None,
+                                        );
+                                    }
+                                }
+                                // Retry without cancel_id
+                                let mut retry_req = req.clone();
+                                retry_req.cancel_id = None;
+                                match state.adapter.create_order(&retry_req).await {
+                                    Ok(ack) if ack.accepted => {
+                                        state.order_tracker.on_rest_response(&external_id, ack.exchange_id);
+                                        return true;
+                                    }
+                                    _ => {} // fall through to rejection below
+                                }
+                            }
+
                             error!(error = %e, id = %external_id, "converge: order creation failed");
                             state.circuit_breaker.record_error();
                             state.order_tracker.on_status_update(
