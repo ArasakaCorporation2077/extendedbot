@@ -69,7 +69,7 @@ one_side_inventory_ratio = 0.45
 hard_one_side_inventory_ratio = 0.70
 
 [risk]
-max_position_usd = 120.0
+max_position_usd = 80.0
 max_daily_loss_usd = 500.0
 max_orders_per_minute = 300
 max_errors_per_minute = 10
