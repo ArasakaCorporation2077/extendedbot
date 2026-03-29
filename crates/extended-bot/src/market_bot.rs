@@ -595,18 +595,19 @@ impl MarketBot {
         };
 
         // Basis filter: block the side that loses when basis is extreme.
-        // ONLY applies when active_side is Both — never override inventory skew.
-        // FIX: Use x10_mid vs binance_mid (not quote_price which includes basis_offset).
+        // ONLY applies when flat (no inventory). When holding a position,
+        // the unwind side must never be blocked — otherwise positions get stuck.
         let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
         let x10_mid = self.state.orderbook.mid().unwrap_or(Decimal::ZERO);
-        if active_side == ActiveSide::Both && !bn_mid.is_zero() && !x10_mid.is_zero() {
+        let is_flat = inventory_ratio.abs() < dec!(0.05);
+        if active_side == ActiveSide::Both && is_flat && !bn_mid.is_zero() && !x10_mid.is_zero() {
             let basis_bps = ((x10_mid - bn_mid) / bn_mid) * dec!(10000);
             if basis_bps > dec!(3) {
-                info!(basis_bps = %basis_bps, "Basis filter → AskOnly");
+                info!(basis_bps = %basis_bps, "Basis filter → AskOnly (flat)");
                 active_side = ActiveSide::AskOnly;
             }
             if basis_bps < dec!(-2) {
-                info!(basis_bps = %basis_bps, "Basis filter → BidOnly");
+                info!(basis_bps = %basis_bps, "Basis filter → BidOnly (flat)");
                 active_side = ActiveSide::BidOnly;
             }
         }
