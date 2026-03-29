@@ -660,8 +660,10 @@ impl MarketBot {
 
         // Skip cancel+requote if new prices are within 1 tick of existing orders.
         // This keeps orders resting on the book longer → more fill opportunities.
-        let tick_size = *self.state.tick_size.read();
-        let skip_threshold = tick_size * dec!(2); // within 2 ticks = skip
+        // Skip threshold: use base_spread_bps as reference (not the dynamic spread
+        // which may be inflated by VPIN/inventory). Half of base_spread in price terms.
+        let base_spread_bps = Decimal::try_from(tc.base_spread_bps).unwrap_or(dec!(4.0));
+        let skip_threshold = (base_spread_bps / dec!(20000)) * fair_price; // half of base_spread
         let live_orders = self.state.order_tracker.live_orders(&market);
         let mut live_bid_price: Option<Decimal> = None;
         let mut live_ask_price: Option<Decimal> = None;
