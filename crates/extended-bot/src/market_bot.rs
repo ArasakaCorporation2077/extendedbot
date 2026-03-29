@@ -588,18 +588,12 @@ impl MarketBot {
         // the unwind side must never be blocked — otherwise positions get stuck.
         let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
         let x10_mid = self.state.orderbook.mid().unwrap_or(Decimal::ZERO);
-        let is_flat = inventory_ratio.abs() < dec!(0.05);
-        if active_side == ActiveSide::Both && is_flat && !bn_mid.is_zero() && !x10_mid.is_zero() {
-            let basis_bps = ((x10_mid - bn_mid) / bn_mid) * dec!(10000);
-            if basis_bps > dec!(3) {
-                info!(basis_bps = %basis_bps, "Basis filter → AskOnly (flat)");
-                active_side = ActiveSide::AskOnly;
-            }
-            if basis_bps < dec!(-2) {
-                info!(basis_bps = %basis_bps, "Basis filter → BidOnly (flat)");
-                active_side = ActiveSide::BidOnly;
-            }
-        }
+        // Basis filter disabled — TAO-USD has structural basis of -7~-10bps
+        // (x10 always cheaper than Binance). Previous thresholds (±3/±2bps)
+        // caused permanent one-sided quoting. Will re-enable with wider
+        // thresholds after collecting more data.
+        // let is_flat = inventory_ratio.abs() < dec!(0.05);
+        // if active_side == ActiveSide::Both && is_flat { ... }
 
         // Time filter: add fixed bps during toxic hours instead of multiplying.
         // Multiplying was causing inventory_spread to double → unwind impossible.
