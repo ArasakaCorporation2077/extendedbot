@@ -414,10 +414,11 @@ impl MarketBot {
             return;
         }
 
-        // Collect live orders for cancel-replace (used in apply_quotes).
-        // No separate mass_cancel — each new order carries cancel_id of the order it replaces.
-        // If not requoting, still check fast cancel for stale orders.
-        if !should_requote && has_live_orders {
+        // Cancel all live orders before requoting, then place fresh quotes.
+        // TODO: Re-enable cancel-replace after live testing confirms x10 cancelId works.
+        if should_requote && has_live_orders {
+            self.cancel_all_live(tick_time).await;
+        } else if has_live_orders {
             self.check_fast_cancel(fp, tick_time).await;
         }
 
@@ -745,55 +746,13 @@ impl MarketBot {
     }
 
     async fn apply_quotes(&mut self, market: &str, quotes: &GeneratedQuotes, tick_time: Instant) {
-        // Cancel-replace: collect existing live orders' exchange_ids by side.
-        // Each new order will carry cancel_id of the order it replaces,
-        // eliminating the separate mass_cancel call and the naked period.
-        let live_orders = self.state.order_tracker.live_orders(market);
-        let mut bid_cancel_ids: Vec<String> = Vec::new();
-        let mut ask_cancel_ids: Vec<String> = Vec::new();
-        for order in &live_orders {
-            if let Some(eid) = &order.exchange_id {
-                if order.status.is_active() {
-                    match order.side {
-                        Side::Buy => bid_cancel_ids.push(eid.clone()),
-                        Side::Sell => ask_cancel_ids.push(eid.clone()),
-                    }
-                }
-            }
-        }
-
-        // If there are more live orders than new quotes on a side,
-        // we need to cancel the extras via mass_cancel (fallback).
-        // Fallback to mass_cancel if:
-        // - More live orders than new quotes on a side (extras won't be replaced)
-        // - Any live order lacks exchange_id (can't use cancel-replace)
-        let extra_bids = bid_cancel_ids.len().saturating_sub(quotes.bids.len());
-        let extra_asks = ask_cancel_ids.len().saturating_sub(quotes.asks.len());
-        let unmatched_count = live_orders.iter().filter(|o| o.exchange_id.is_none() && o.status.is_active()).count();
-        if extra_bids + extra_asks > 0 || unmatched_count > 0 {
-            if let Err(e) = self.state.adapter.mass_cancel(market).await {
-                warn!(error = %e, "Fallback mass cancel failed");
-            }
-            // Clear cancel_ids — mass_cancel already cancelled everything.
-            bid_cancel_ids.clear();
-            ask_cancel_ids.clear();
-            // Mark all live as cancelled in tracker.
-            for order in &live_orders {
-                self.state.order_tracker.on_status_update(
-                    &order.external_id, OrderStatus::Cancelled,
-                    None, None, None, None,
-                );
-            }
-        }
-
-        // Build order requests with cancel_id for cancel-replace.
+        // Cancels already fired in cancel_all_live() before quote pipeline.
+        // TODO: Re-enable cancel-replace after live testing confirms x10 cancelId works.
         let mut order_reqs = Vec::new();
         let mut batch_exposure_usd = Decimal::ZERO;
-        let mut bid_idx = 0usize;
-        let mut ask_idx = 0usize;
 
         for quote in quotes.bids.iter().map(|q| (Side::Buy, q)).chain(quotes.asks.iter().map(|q| (Side::Sell, q))) {
-            if let Some(mut req) = self.prepare_order_with_batch_exposure(
+            if let Some(req) = self.prepare_order_with_batch_exposure(
                 market,
                 quote.0,
                 quote.1.price,
@@ -801,31 +760,15 @@ impl MarketBot {
                 quotes.reduce_only,
                 &mut batch_exposure_usd,
             ) {
-                // Attach cancel_id for the order this one replaces.
-                match quote.0 {
-                    Side::Buy => {
-                        if bid_idx < bid_cancel_ids.len() {
-                            req.cancel_id = Some(bid_cancel_ids[bid_idx].clone());
-                            bid_idx += 1;
-                        }
-                    }
-                    Side::Sell => {
-                        if ask_idx < ask_cancel_ids.len() {
-                            req.cancel_id = Some(ask_cancel_ids[ask_idx].clone());
-                            ask_idx += 1;
-                        }
-                    }
-                }
                 order_reqs.push(req);
             }
         }
 
-        // Send all orders in parallel (with cancel-replace via cancel_id)
+        // Send all orders in parallel
         if !order_reqs.is_empty() {
             let order_futs: Vec<_> = order_reqs.iter().map(|req| {
                 let state = &self.state;
                 let external_id = req.external_id.clone();
-                let cancel_id = req.cancel_id.clone();
                 async move {
                     let t0 = Instant::now();
                     match state.adapter.create_order(req).await {
@@ -842,15 +785,6 @@ impl MarketBot {
                                     None, None, None, None,
                                 );
                                 return false;
-                            }
-                            // Cancel-replace succeeded: mark the old order as cancelled.
-                            if let Some(old_eid) = &cancel_id {
-                                if let Some(old_ext) = state.order_tracker.resolve_exchange_id(old_eid) {
-                                    state.order_tracker.on_status_update(
-                                        &old_ext, OrderStatus::Cancelled,
-                                        None, None, None, None,
-                                    );
-                                }
                             }
                             true
                         }
