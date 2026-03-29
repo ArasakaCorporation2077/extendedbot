@@ -1,7 +1,7 @@
 # Extended Exchange Market Maker - Mainnet Config
 
 [exchange]
-paper_trading = false
+paper_trading = true
 user_agent = "extended-mm/0.1.0"
 # API key and secret from env: EXTENDED_API_KEY, EXTENDED_API_SECRET
 

@@ -91,6 +91,9 @@ pub struct MarketBot {
     last_depth_imbalance: f64,
     consecutive_rejects: u32,
     order_seq: u64,
+    is_requoting: bool,
+    pending_fill_requote: bool,
+    basis_ema: Decimal,
 }
 
 impl MarketBot {
@@ -166,6 +169,9 @@ impl MarketBot {
             last_depth_imbalance: 0.0,
             consecutive_rejects: 0,
             order_seq: 0,
+            is_requoting: false,
+            pending_fill_requote: false,
+            basis_ema: Decimal::ZERO,
         }
     }
 
@@ -224,6 +230,9 @@ impl MarketBot {
                 // Private WS may omit external_id; without this, updates are lost.
                 let resolved_ext_id = self.resolve_external_id(&external_id, &exchange_id);
                 self.on_order_update(resolved_ext_id, exchange_id, status, filled_qty, remaining_qty, avg_fill_price);
+                if status == OrderStatus::Filled || status == OrderStatus::PartiallyFilled {
+                    self.pending_fill_requote = true;
+                }
             }
             BotEvent::Fill {
                 external_id, exchange_id, price, qty, fee, is_maker, ts,
@@ -258,6 +267,7 @@ impl MarketBot {
                 // P0-7 FIX: Markout recording moved to on_order_update (FILLED status)
                 // to avoid double-counting. Fill events are unreliable on x10.
                 self.on_fill(&resolved_ext_id, price, qty, fee, is_maker);
+                self.pending_fill_requote = true;
             }
             BotEvent::PositionUpdate { market, size, entry_price, mark_price, .. } => {
                 self.state.position_manager.set_position(&market, size, entry_price, mark_price);
@@ -353,7 +363,9 @@ impl MarketBot {
         } else {
             min_interval
         };
-        let should_requote = self.last_requote.elapsed() >= effective_interval && (price_change >= threshold || !has_live_orders);
+        let fill_urgent = self.pending_fill_requote;
+        if fill_urgent { self.pending_fill_requote = false; }
+        let should_requote = fill_urgent || (self.last_requote.elapsed() >= effective_interval && (price_change >= threshold || !has_live_orders));
 
         // Fast cancel check when NOT requoting (stale/aged orders).
         // Full cancel moved into requote() — only cancels when prices actually changed.
@@ -441,10 +453,7 @@ impl MarketBot {
                 self.state.latency.record_cancel_rtt(t0.elapsed().as_micros() as u64);
                 self.state.latency.record_tick_to_cancel(tick_time.elapsed().as_micros() as u64);
 
-                // Force-mark orders Cancelled so the tracker is clean before new quotes.
-                // We do not wait for WS confirmation — the REST ACK is sufficient proof
-                // the exchange received the cancel. WS events will arrive asynchronously
-                // but are no-ops because the orders are already in terminal state here.
+                // Force-mark Cancelled only after REST confirms exchange received cancel.
                 for order in &live_orders {
                     self.state.order_tracker.on_status_update(
                         &order.external_id,
@@ -452,10 +461,6 @@ impl MarketBot {
                         None, None, None, None,
                     );
                 }
-
-                // Brief pause so the exchange has time to process the cancel before
-                // new orders arrive. 5ms is sufficient for same-region (Tokyo→Tokyo).
-                tokio::time::sleep(Duration::from_millis(5)).await;
             }
             Err(e) => {
                 warn!(error = %e, "Mass cancel failed");
@@ -525,10 +530,19 @@ impl MarketBot {
     }
 
     async fn requote(&mut self, fair_price: Decimal, tick_time: Instant) {
-        if self.state.smoke_mode { return; }
+        if self.is_requoting {
+            debug!("Requote already in progress — skipping overlapping call");
+            return;
+        }
+        self.is_requoting = true;
+
+        if self.state.smoke_mode {
+            self.is_requoting = false;
+            return;
+        }
         if !self.state.circuit_breaker.is_trading_allowed() {
             debug!("Circuit breaker active, skipping requote");
-
+            self.is_requoting = false;
             return;
         }
 
@@ -583,17 +597,33 @@ impl MarketBot {
             ActiveSide::Both
         };
 
-        // Basis filter: block the side that loses when basis is extreme.
+        // Basis filter: block the side that loses when basis deviates significantly from its EMA.
+        // Uses EMA to track structural basis, only blocks on sudden deviations (>10bps).
         // ONLY applies when flat (no inventory). When holding a position,
         // the unwind side must never be blocked — otherwise positions get stuck.
-        let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
         let x10_mid = self.state.orderbook.mid().unwrap_or(Decimal::ZERO);
-        // Basis filter disabled — TAO-USD has structural basis of -7~-10bps
-        // (x10 always cheaper than Binance). Previous thresholds (±3/±2bps)
-        // caused permanent one-sided quoting. Will re-enable with wider
-        // thresholds after collecting more data.
-        // let is_flat = inventory_ratio.abs() < dec!(0.05);
-        // if active_side == ActiveSide::Both && is_flat { ... }
+        let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
+        if !bn_mid.is_zero() && !x10_mid.is_zero() {
+            let current_basis_bps = ((x10_mid - bn_mid) / bn_mid) * dec!(10000);
+            // Update rolling EMA of basis (slow tracking of structural basis)
+            if self.basis_ema.is_zero() {
+                self.basis_ema = current_basis_bps; // initialize
+            } else {
+                self.basis_ema = self.basis_ema * dec!(0.99) + current_basis_bps * dec!(0.01);
+            }
+            let basis_deviation = (current_basis_bps - self.basis_ema).abs();
+
+            let is_flat = inventory_ratio.abs() < dec!(0.05);
+            if active_side == ActiveSide::Both && is_flat && basis_deviation > dec!(10) {
+                if current_basis_bps > self.basis_ema {
+                    active_side = ActiveSide::AskOnly;
+                    info!(basis_deviation = %basis_deviation, "Basis filter → AskOnly (sudden premium)");
+                } else {
+                    active_side = ActiveSide::BidOnly;
+                    info!(basis_deviation = %basis_deviation, "Basis filter → BidOnly (sudden discount)");
+                }
+            }
+        }
 
         // Time filter: add fixed bps during toxic hours instead of multiplying.
         // Multiplying was causing inventory_spread to double → unwind impossible.
@@ -657,7 +687,7 @@ impl MarketBot {
         // Skip threshold: use base_spread_bps as reference (not the dynamic spread
         // which may be inflated by VPIN/inventory). Half of base_spread in price terms.
         let base_spread_bps = Decimal::try_from(tc.base_spread_bps).unwrap_or(dec!(4.0));
-        let skip_threshold = (base_spread_bps / dec!(20000)) * fair_price; // half of base_spread
+        let skip_threshold = (base_spread_bps / dec!(20000)) * fair_price; // half base_spread
         let live_orders = self.state.order_tracker.live_orders(&market);
         let mut live_bid_price: Option<Decimal> = None;
         let mut live_ask_price: Option<Decimal> = None;
@@ -691,6 +721,7 @@ impl MarketBot {
                 new_ask = ?new_ask_price,
                 "Prices within tick threshold — keeping existing orders"
             );
+            self.is_requoting = false;
             return;
         }
 
@@ -720,12 +751,15 @@ impl MarketBot {
         } else {
             debug!(cycle_us, "Requote cycle");
         }
+
+        self.is_requoting = false;
     }
 
     async fn apply_quotes(&mut self, market: &str, quotes: &GeneratedQuotes, tick_time: Instant) {
         // Cancels already fired in cancel_all_live() before quote pipeline.
         let mut order_reqs = Vec::new();
-        let mut batch_exposure_usd = Decimal::ZERO;
+        let mut batch_bid_usd = Decimal::ZERO;
+        let mut batch_ask_usd = Decimal::ZERO;
 
         let total_quotes = quotes.bids.len() + quotes.asks.len();
         if total_quotes == 0 {
@@ -740,7 +774,8 @@ impl MarketBot {
                 quote.1.price,
                 quote.1.size,
                 quotes.reduce_only,
-                &mut batch_exposure_usd,
+                &mut batch_bid_usd,
+                &mut batch_ask_usd,
             ) {
                 order_reqs.push(req);
             } else {
@@ -756,7 +791,8 @@ impl MarketBot {
         info!(
             prepared = order_reqs.len(),
             total_quotes = total_quotes,
-            batch_exposure = %batch_exposure_usd,
+            batch_bid_usd = %batch_bid_usd,
+            batch_ask_usd = %batch_ask_usd,
             "apply_quotes: orders prepared"
         );
 
@@ -815,8 +851,8 @@ impl MarketBot {
 
     /// Prepare an order request synchronously (risk checks, signing params, tracker registration).
     /// Returns None if the order is blocked by risk limits.
-    /// P0-3 FIX: Added batch_exposure_usd parameter to track cumulative exposure across
-    /// orders being prepared in the same batch, preventing race condition.
+    /// BUG-B FIX: Split batch exposure into separate bid/ask counters so each side is checked
+    /// independently. This prevents a large ask batch from blocking bid orders (and vice versa).
     fn prepare_order_with_batch_exposure(
         &mut self,
         market: &str,
@@ -824,7 +860,8 @@ impl MarketBot {
         price: Decimal,
         qty: Decimal,
         reduce_only: bool,
-        batch_exposure_usd: &mut Decimal,
+        batch_bid_usd: &mut Decimal,
+        batch_ask_usd: &mut Decimal,
     ) -> Option<OrderRequest> {
         // Risk limit checks: skip for reduce-only orders (they decrease exposure)
         if !reduce_only {
@@ -848,36 +885,38 @@ impl MarketBot {
             let (bid_exp, ask_exp) = self.state.order_tracker.pending_exposure(market, mark);
             self.state.exposure_tracker.update_pending_orders(market, bid_exp, ask_exp);
 
-            // Worst-case exposure = max(|pos + all_bids|, |pos - all_asks|).
-            // For MM with bid+ask, worst case is ONE side, not both.
-            // batch_exposure tracks the LARGER side only.
             let order_notional = qty * price;
-            let worst_case = self.state.exposure_tracker.worst_case_exposure_usd();
-            let net_position = self.state.exposure_tracker.net_exposure_usd();
-            let increases_exposure = if net_position > Decimal::ZERO {
-                is_buy
-            } else if net_position < Decimal::ZERO {
-                !is_buy
-            } else {
-                is_buy // flat: only count buy side (symmetric, just pick one)
-            };
-            let batch_contribution = if increases_exposure { *batch_exposure_usd + order_notional } else { Decimal::ZERO };
-            if worst_case + batch_contribution > self.state.exposure_tracker.max_total_usd() {
+            let pos_usd = self.state.exposure_tracker.net_exposure_usd();
+
+            // Include existing pending orders from tracker + this batch
+            let new_bid = bid_exp + *batch_bid_usd + if side == Side::Buy { order_notional } else { Decimal::ZERO };
+            let new_ask = ask_exp + *batch_ask_usd + if side == Side::Sell { order_notional } else { Decimal::ZERO };
+
+            // Worst case: max of going fully long vs fully short
+            let worst_long = (pos_usd + new_bid).abs();
+            let worst_short = (pos_usd - new_ask).abs();
+            let worst_case = worst_long.max(worst_short);
+
+            if worst_case > self.state.exposure_tracker.max_total_usd() {
                 debug!(
                     side = %side,
                     order_usd = %order_notional,
-                    batch_usd = %batch_exposure_usd,
-                    worst_case = %worst_case,
-                    net_position = %net_position,
+                    batch_bid_usd = %batch_bid_usd,
+                    batch_ask_usd = %batch_ask_usd,
+                    worst_long = %worst_long,
+                    worst_short = %worst_short,
+                    pos_usd = %pos_usd,
                     max = %self.state.exposure_tracker.max_total_usd(),
                     "Order blocked: worst-case exposure limit (with batch) reached"
                 );
                 return None;
             }
 
-            // Accumulate batch exposure only for orders that increase worst-case
-            if increases_exposure {
-                *batch_exposure_usd += order_notional;
+            // Accumulate batch exposure per side
+            if side == Side::Buy {
+                *batch_bid_usd += order_notional;
+            } else {
+                *batch_ask_usd += order_notional;
             }
         }
 

@@ -388,19 +388,23 @@ impl ExtendedWebSocket {
                 }
 
                 if let Some(positions) = wrapper.positions {
-                    for pos in positions {
-                        let signed_size = match pos.side.as_deref() {
-                            Some("SHORT") => -pos.size,
-                            _ => pos.size,
-                        };
-                        let _ = event_tx.send(BotEvent::PositionUpdate {
-                            market: pos.market,
-                            size: signed_size,
-                            entry_price: pos.open_price.unwrap_or_default(),
-                            mark_price: pos.mark_price.unwrap_or_default(),
-                            unrealized_pnl: pos.unrealised_pnl.unwrap_or_default(),
-                            ts: pos.updated_at.or(pos.created_at).unwrap_or(0),
-                        });
+                    if msg_type == "SNAPSHOT" && positions.is_empty() {
+                        warn!("Ignoring empty position snapshot");
+                    } else {
+                        for pos in positions {
+                            let signed_size = match pos.side.as_deref() {
+                                Some("SHORT") => -pos.size,
+                                _ => pos.size,
+                            };
+                            let _ = event_tx.send(BotEvent::PositionUpdate {
+                                market: pos.market,
+                                size: signed_size,
+                                entry_price: pos.open_price.unwrap_or_default(),
+                                mark_price: pos.mark_price.unwrap_or_default(),
+                                unrealized_pnl: pos.unrealised_pnl.unwrap_or_default(),
+                                ts: pos.updated_at.or(pos.created_at).unwrap_or(0),
+                            });
+                        }
                     }
                 }
 
