@@ -355,20 +355,9 @@ impl MarketBot {
         };
         let should_requote = self.last_requote.elapsed() >= effective_interval && (price_change >= threshold || !has_live_orders);
 
-        // Cancel IMMEDIATELY — before any non-critical computation
-        if should_requote && has_live_orders {
-            let pre_cancel = t0.elapsed().as_micros();
-            self.cancel_all_live(tick_time).await;
-            let post_cancel = t0.elapsed().as_micros();
-            debug!(
-                binance_age_us = binance_age_us as u64,
-                compute_us = compute_us as u64,
-                pre_cancel_us = pre_cancel as u64,
-                cancel_us = (post_cancel - pre_cancel) as u64,
-                total_us = post_cancel as u64,
-                "Latency breakdown: binance_tick_age → compute → cancel"
-            );
-        } else if has_live_orders {
+        // Fast cancel check when NOT requoting (stale/aged orders).
+        // Full cancel moved into requote() — only cancels when prices actually changed.
+        if !should_requote && has_live_orders {
             self.check_fast_cancel(fp, tick_time).await;
         }
 
@@ -669,6 +658,46 @@ impl MarketBot {
 
         let quotes = self.quote_gen.generate(&input);
 
+        // Skip cancel+requote if new prices are within 1 tick of existing orders.
+        // This keeps orders resting on the book longer → more fill opportunities.
+        let tick_size = *self.state.tick_size.read();
+        let skip_threshold = tick_size * dec!(2); // within 2 ticks = skip
+        let live_orders = self.state.order_tracker.live_orders(&market);
+        let mut live_bid_price: Option<Decimal> = None;
+        let mut live_ask_price: Option<Decimal> = None;
+        for o in &live_orders {
+            if o.status.is_active() {
+                match o.side {
+                    Side::Buy => { if live_bid_price.is_none() || o.price > live_bid_price.unwrap() { live_bid_price = Some(o.price); } }
+                    Side::Sell => { if live_ask_price.is_none() || o.price < live_ask_price.unwrap() { live_ask_price = Some(o.price); } }
+                }
+            }
+        }
+        let new_bid_price = quotes.bids.first().map(|q| q.price);
+        let new_ask_price = quotes.asks.first().map(|q| q.price);
+
+        let bid_changed = match (new_bid_price, live_bid_price) {
+            (Some(new), Some(old)) => (new - old).abs() > skip_threshold,
+            (Some(_), None) | (None, Some(_)) => true, // side added/removed
+            (None, None) => false,
+        };
+        let ask_changed = match (new_ask_price, live_ask_price) {
+            (Some(new), Some(old)) => (new - old).abs() > skip_threshold,
+            (Some(_), None) | (None, Some(_)) => true,
+            (None, None) => false,
+        };
+
+        if !bid_changed && !ask_changed && !live_orders.is_empty() {
+            debug!(
+                live_bid = ?live_bid_price,
+                live_ask = ?live_ask_price,
+                new_bid = ?new_bid_price,
+                new_ask = ?new_ask_price,
+                "Prices within tick threshold — keeping existing orders"
+            );
+            return;
+        }
+
         info!(
             bids = quotes.bids.len(),
             asks = quotes.asks.len(),
@@ -676,10 +705,17 @@ impl MarketBot {
             active_side = ?active_side,
             inventory_ratio = %inventory_ratio,
             base_size = %base_size,
-            "Quote generation result"
+            bid_changed,
+            ask_changed,
+            "Quote generation result — will cancel and replace"
         );
 
-        // Diff current orders vs desired quotes and send changes
+        // Cancel existing orders before placing new ones
+        if !live_orders.is_empty() {
+            self.cancel_all_live(tick_time).await;
+        }
+
+        // Place new quotes
         let t0 = Instant::now();
         self.apply_quotes(&market, &quotes, tick_time).await;
         let cycle_us = t0.elapsed().as_micros();
