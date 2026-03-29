@@ -92,7 +92,6 @@ pub struct MarketBot {
     consecutive_rejects: u32,
     order_seq: u64,
     is_requoting: bool,
-    pending_fill_requote: bool,
     basis_ema: Decimal,
 }
 
@@ -170,7 +169,6 @@ impl MarketBot {
             consecutive_rejects: 0,
             order_seq: 0,
             is_requoting: false,
-            pending_fill_requote: false,
             basis_ema: Decimal::ZERO,
         }
     }
@@ -231,7 +229,8 @@ impl MarketBot {
                 let resolved_ext_id = self.resolve_external_id(&external_id, &exchange_id);
                 self.on_order_update(resolved_ext_id, exchange_id, status, filled_qty, remaining_qty, avg_fill_price);
                 if status == OrderStatus::Filled || status == OrderStatus::PartiallyFilled {
-                    self.pending_fill_requote = true;
+                    // Force requote on next eligible cycle to replenish the filled side.
+                    self.last_quoted_fp = None;
                 }
             }
             BotEvent::Fill {
@@ -267,7 +266,8 @@ impl MarketBot {
                 // P0-7 FIX: Markout recording moved to on_order_update (FILLED status)
                 // to avoid double-counting. Fill events are unreliable on x10.
                 self.on_fill(&resolved_ext_id, price, qty, fee, is_maker);
-                self.pending_fill_requote = true;
+                // Force requote on next eligible cycle to replenish the filled side.
+                self.last_quoted_fp = None;
             }
             BotEvent::PositionUpdate { market, size, entry_price, mark_price, .. } => {
                 self.state.position_manager.set_position(&market, size, entry_price, mark_price);
@@ -363,9 +363,11 @@ impl MarketBot {
         } else {
             min_interval
         };
-        let fill_urgent = self.pending_fill_requote;
-        if fill_urgent { self.pending_fill_requote = false; }
-        let should_requote = fill_urgent || (self.last_requote.elapsed() >= effective_interval && (price_change >= threshold || !has_live_orders));
+        // After a fill, last_quoted_fp is set to None → price_change = 9999.
+        // Bypass the interval gate in that case to replenish the filled side quickly.
+        let fill_urgent = self.last_quoted_fp.is_none();
+        let should_requote = (fill_urgent || self.last_requote.elapsed() >= effective_interval)
+            && (price_change >= threshold || !has_live_orders);
 
         // Fast cancel check when NOT requoting (stale/aged orders).
         // Full cancel moved into requote() — only cancels when prices actually changed.
@@ -430,10 +432,8 @@ impl MarketBot {
     }
 
     /// Cancel all live orders via mass cancel (single REST call).
-    /// P1-1 FIX: Fire-and-forget cancel — no WS wait. Force-mark all pending-cancel
-    /// orders as Cancelled immediately and add a short 50ms delay before the caller
-    /// places new quotes. This eliminates the ~200ms quote gap that the old WS-wait
-    /// approach caused (40% of the 500ms requote cycle).
+    /// Kept for ROC guard / emergency use only. Normal flow uses converge_orders.
+    #[allow(dead_code)]
     async fn cancel_all_live(&self, tick_time: Instant) {
         if self.state.smoke_mode { return; }
         let market = self.state.market();
@@ -484,13 +484,19 @@ impl MarketBot {
 
         let live_orders = self.state.order_tracker.live_orders(self.state.market());
 
-        // Collect which orders need cancelling before touching state.
-        let mut any_cancel = false;
+        // Collect exchange IDs of orders that need cancelling.
+        let mut cancel_eids: Vec<(String, String)> = Vec::new(); // (exchange_id, external_id)
         for order in &live_orders {
             // Skip orders already pending cancel — no need to send another cancel request.
             if order.status == OrderStatus::PendingCancel {
                 continue;
             }
+
+            // Skip orders without an exchange_id — cannot cancel individually yet.
+            let exchange_id = match &order.exchange_id {
+                Some(eid) => eid.clone(),
+                None => continue,
+            };
 
             let info = LiveOrderInfo {
                 order_price: order.price,
@@ -505,27 +511,41 @@ impl MarketBot {
                     "Fast cancel triggered"
                 );
                 self.state.order_tracker.mark_pending_cancel(&order.external_id);
-                any_cancel = true;
+                cancel_eids.push((exchange_id, order.external_id.clone()));
             }
         }
 
-        // Use a single mass_cancel instead of one DELETE per order.
-        // This costs 1 req regardless of how many orders are live (vs N individual DELETEs).
-        if any_cancel {
+        // Cancel each order individually by exchange_id.
+        if !cancel_eids.is_empty() {
             self.last_fast_cancel = Some(Instant::now());
             let t0 = Instant::now();
-            match self.state.adapter.mass_cancel(self.state.market()).await {
-                Ok(_) => {
-                    let cancel_rtt = t0.elapsed().as_micros() as u64;
-                    let tick_to_cancel = tick_time.elapsed().as_micros() as u64;
-                    self.state.latency.record_cancel_rtt(cancel_rtt);
-                    self.state.latency.record_tick_to_cancel(tick_to_cancel);
+            let cancel_futs: Vec<_> = cancel_eids.iter().map(|(eid, ext_id)| {
+                let state = &self.state;
+                let exchange_id = eid.clone();
+                let external_id = ext_id.clone();
+                async move {
+                    match state.adapter.cancel_order(&exchange_id).await {
+                        Ok(ack) => {
+                            if ack.success {
+                                state.order_tracker.on_status_update(
+                                    &external_id, OrderStatus::Cancelled, None, None, None, None,
+                                );
+                            } else {
+                                warn!(exchange_id = %exchange_id, "Fast cancel: individual cancel failed");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, exchange_id = %exchange_id, "Fast cancel: individual cancel error");
+                            state.circuit_breaker.record_error();
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!(error = %e, "Fast cancel (mass) failed");
-                    self.state.circuit_breaker.record_error();
-                }
-            }
+            }).collect();
+            futures_util::future::join_all(cancel_futs).await;
+            let cancel_rtt = t0.elapsed().as_micros() as u64;
+            let tick_to_cancel = tick_time.elapsed().as_micros() as u64;
+            self.state.latency.record_cancel_rtt(cancel_rtt);
+            self.state.latency.record_tick_to_cancel(tick_to_cancel);
         }
     }
 
@@ -682,49 +702,6 @@ impl MarketBot {
 
         let quotes = self.quote_gen.generate(&input);
 
-        // Skip cancel+requote if new prices are within 1 tick of existing orders.
-        // This keeps orders resting on the book longer → more fill opportunities.
-        // Skip threshold: use base_spread_bps as reference (not the dynamic spread
-        // which may be inflated by VPIN/inventory). Half of base_spread in price terms.
-        let base_spread_bps = Decimal::try_from(tc.base_spread_bps).unwrap_or(dec!(4.0));
-        let skip_threshold = (base_spread_bps / dec!(20000)) * fair_price; // half base_spread
-        let live_orders = self.state.order_tracker.live_orders(&market);
-        let mut live_bid_price: Option<Decimal> = None;
-        let mut live_ask_price: Option<Decimal> = None;
-        for o in &live_orders {
-            if o.status.is_active() {
-                match o.side {
-                    Side::Buy => { if live_bid_price.is_none() || o.price > live_bid_price.unwrap() { live_bid_price = Some(o.price); } }
-                    Side::Sell => { if live_ask_price.is_none() || o.price < live_ask_price.unwrap() { live_ask_price = Some(o.price); } }
-                }
-            }
-        }
-        let new_bid_price = quotes.bids.first().map(|q| q.price);
-        let new_ask_price = quotes.asks.first().map(|q| q.price);
-
-        let bid_changed = match (new_bid_price, live_bid_price) {
-            (Some(new), Some(old)) => (new - old).abs() > skip_threshold,
-            (Some(_), None) | (None, Some(_)) => true, // side added/removed
-            (None, None) => false,
-        };
-        let ask_changed = match (new_ask_price, live_ask_price) {
-            (Some(new), Some(old)) => (new - old).abs() > skip_threshold,
-            (Some(_), None) | (None, Some(_)) => true,
-            (None, None) => false,
-        };
-
-        if !bid_changed && !ask_changed && !live_orders.is_empty() {
-            debug!(
-                live_bid = ?live_bid_price,
-                live_ask = ?live_ask_price,
-                new_bid = ?new_bid_price,
-                new_ask = ?new_ask_price,
-                "Prices within tick threshold — keeping existing orders"
-            );
-            self.is_requoting = false;
-            return;
-        }
-
         info!(
             bids = quotes.bids.len(),
             asks = quotes.asks.len(),
@@ -732,19 +709,11 @@ impl MarketBot {
             active_side = ?active_side,
             inventory_ratio = %inventory_ratio,
             base_size = %base_size,
-            bid_changed,
-            ask_changed,
-            "Quote generation result — will cancel and replace"
+            "Quote generation result — converging orders"
         );
 
-        // Cancel existing orders before placing new ones
-        if !live_orders.is_empty() {
-            self.cancel_all_live(tick_time).await;
-        }
-
-        // Place new quotes
         let t0 = Instant::now();
-        self.apply_quotes(&market, &quotes, tick_time).await;
+        self.converge_orders(&market, &quotes, tick_time).await;
         let cycle_us = t0.elapsed().as_micros();
         if cycle_us > 50_000 {
             warn!(cycle_us, bids = quotes.bids.len(), asks = quotes.asks.len(), "Requote cycle slow (>50ms)");
@@ -755,6 +724,8 @@ impl MarketBot {
         self.is_requoting = false;
     }
 
+    /// Legacy mass-cancel-then-place method. Kept for reference; replaced by converge_orders.
+    #[allow(dead_code)]
     async fn apply_quotes(&mut self, market: &str, quotes: &GeneratedQuotes, tick_time: Instant) {
         // Cancels already fired in cancel_all_live() before quote pipeline.
         let mut order_reqs = Vec::new();
@@ -846,6 +817,233 @@ impl MarketBot {
                 self.consecutive_rejects += 1;
                 warn!(rejects = reject_count, total = results.len(), consecutive = self.consecutive_rejects, "Partial or full order rejection");
             }
+        }
+    }
+
+    /// Converge live orders to match desired quotes using cancel-replace instead of mass cancel.
+    ///
+    /// For each desired quote level:
+    ///   - Same price (within 1 tick) AND same size → skip (order unchanged)
+    ///   - Different price or size → cancel-replace (set cancel_id on new order)
+    ///   - No matching live order → place new order
+    /// Extra live orders (more than desired) are cancelled individually.
+    async fn converge_orders(&mut self, market: &str, quotes: &GeneratedQuotes, tick_time: Instant) {
+        if self.state.smoke_mode { return; }
+
+        let tick_size = *self.state.tick_size.read();
+        let live_orders = self.state.order_tracker.live_orders(market);
+
+        // Partition live orders by side. Only include orders that have an exchange_id
+        // (confirmed by exchange) and are NOT already pending cancel.
+        let mut live_bids: Vec<_> = live_orders.iter()
+            .filter(|o| o.side == Side::Buy && o.exchange_id.is_some()
+                && o.status != OrderStatus::PendingCancel)
+            .collect();
+        let mut live_asks: Vec<_> = live_orders.iter()
+            .filter(|o| o.side == Side::Sell && o.exchange_id.is_some()
+                && o.status != OrderStatus::PendingCancel)
+            .collect();
+
+        // Sort by price desc for bids, asc for asks — level 0 = best price
+        live_bids.sort_by(|a, b| b.price.cmp(&a.price));
+        live_asks.sort_by(|a, b| a.price.cmp(&b.price));
+
+        let mut order_reqs: Vec<(OrderRequest, Option<String>)> = Vec::new(); // (req, cancel_id)
+        let mut cancel_eids: Vec<String> = Vec::new(); // exchange IDs of extra orders to cancel
+        let mut batch_bid_usd = Decimal::ZERO;
+        let mut batch_ask_usd = Decimal::ZERO;
+
+        // Process desired bid levels
+        for (i, desired) in quotes.bids.iter().enumerate() {
+            if let Some(live) = live_bids.get(i) {
+                let price_diff = (live.price - desired.price).abs();
+                let size_diff = (live.remaining_qty - desired.size).abs();
+                if price_diff <= tick_size && size_diff <= tick_size {
+                    debug!(
+                        external_id = %live.external_id,
+                        price = %live.price,
+                        "converge: bid order unchanged"
+                    );
+                    continue; // leave this order alone
+                }
+                // Need cancel-replace
+                let exchange_id = live.exchange_id.clone().unwrap(); // safe: filtered above
+                debug!(
+                    external_id = %live.external_id,
+                    old_price = %live.price,
+                    new_price = %desired.price,
+                    "converge: replacing bid order"
+                );
+                if let Some(req) = self.prepare_order_with_batch_exposure(
+                    market, Side::Buy, desired.price, desired.size, quotes.reduce_only,
+                    &mut batch_bid_usd, &mut batch_ask_usd,
+                ) {
+                    order_reqs.push((req, Some(exchange_id)));
+                }
+            } else {
+                // No matching live order — place new
+                debug!(price = %desired.price, "converge: placing new bid order");
+                if let Some(req) = self.prepare_order_with_batch_exposure(
+                    market, Side::Buy, desired.price, desired.size, quotes.reduce_only,
+                    &mut batch_bid_usd, &mut batch_ask_usd,
+                ) {
+                    order_reqs.push((req, None));
+                }
+            }
+        }
+
+        // Cancel extra live bids beyond what we want
+        for extra in live_bids.iter().skip(quotes.bids.len()) {
+            let eid = extra.exchange_id.clone().unwrap(); // safe: filtered above
+            debug!(external_id = %extra.external_id, "converge: cancelling extra bid order");
+            cancel_eids.push(eid);
+        }
+
+        // Process desired ask levels
+        for (i, desired) in quotes.asks.iter().enumerate() {
+            if let Some(live) = live_asks.get(i) {
+                let price_diff = (live.price - desired.price).abs();
+                let size_diff = (live.remaining_qty - desired.size).abs();
+                if price_diff <= tick_size && size_diff <= tick_size {
+                    debug!(
+                        external_id = %live.external_id,
+                        price = %live.price,
+                        "converge: ask order unchanged"
+                    );
+                    continue;
+                }
+                let exchange_id = live.exchange_id.clone().unwrap();
+                debug!(
+                    external_id = %live.external_id,
+                    old_price = %live.price,
+                    new_price = %desired.price,
+                    "converge: replacing ask order"
+                );
+                if let Some(req) = self.prepare_order_with_batch_exposure(
+                    market, Side::Sell, desired.price, desired.size, quotes.reduce_only,
+                    &mut batch_bid_usd, &mut batch_ask_usd,
+                ) {
+                    order_reqs.push((req, Some(exchange_id)));
+                }
+            } else {
+                debug!(price = %desired.price, "converge: placing new ask order");
+                if let Some(req) = self.prepare_order_with_batch_exposure(
+                    market, Side::Sell, desired.price, desired.size, quotes.reduce_only,
+                    &mut batch_bid_usd, &mut batch_ask_usd,
+                ) {
+                    order_reqs.push((req, None));
+                }
+            }
+        }
+
+        // Cancel extra live asks beyond what we want
+        for extra in live_asks.iter().skip(quotes.asks.len()) {
+            let eid = extra.exchange_id.clone().unwrap();
+            debug!(external_id = %extra.external_id, "converge: cancelling extra ask order");
+            cancel_eids.push(eid);
+        }
+
+        // Also cancel any live orders without an exchange_id on the next pass (skip for now)
+        // — they will be handled once the exchange_id arrives via WS.
+
+        info!(
+            new_orders = order_reqs.iter().filter(|(_, c)| c.is_none()).count(),
+            replacements = order_reqs.iter().filter(|(_, c)| c.is_some()).count(),
+            extra_cancels = cancel_eids.len(),
+            "converge_orders: plan"
+        );
+
+        // Send new/replacement orders in parallel
+        if !order_reqs.is_empty() {
+            // Attach cancel_id to replacement requests
+            let prepared: Vec<OrderRequest> = order_reqs.iter().map(|(req, cancel_id)| {
+                let mut r = req.clone();
+                r.cancel_id = cancel_id.clone();
+                r
+            }).collect();
+
+            // Keep (external_id, cancel_id) for post-processing
+            let id_map: Vec<(String, Option<String>)> = order_reqs.iter()
+                .map(|(req, cancel_id)| (req.external_id.clone(), cancel_id.clone()))
+                .collect();
+
+            let order_futs: Vec<_> = prepared.iter().zip(id_map.iter()).map(|(req, (ext_id, cancel_id))| {
+                let state = &self.state;
+                let external_id = ext_id.clone();
+                let old_cancel_id = cancel_id.clone();
+                async move {
+                    let t0 = Instant::now();
+                    match state.adapter.create_order(req).await {
+                        Ok(ack) => {
+                            let rtt = t0.elapsed().as_micros() as u64;
+                            let ttt = tick_time.elapsed().as_micros() as u64;
+                            state.latency.record_order_rtt(rtt);
+                            state.latency.record_tick_to_trade(ttt);
+                            state.order_tracker.on_rest_response(&external_id, ack.exchange_id);
+                            if !ack.accepted {
+                                warn!(id = %external_id, msg = ?ack.message, "converge: order rejected");
+                                state.order_tracker.on_status_update(
+                                    &external_id, OrderStatus::Rejected,
+                                    None, None, None, None,
+                                );
+                                return false;
+                            }
+                            // Don't mark old order Cancelled locally — let the WS
+                            // CANCELLED event from the exchange handle it. Marking it
+                            // here could race with a WS FILLED event and drop the fill.
+                            true
+                        }
+                        Err(e) => {
+                            let rtt = t0.elapsed().as_micros() as u64;
+                            state.latency.record_order_rtt(rtt);
+                            state.latency.record_tick_to_trade(tick_time.elapsed().as_micros() as u64);
+                            error!(error = %e, id = %external_id, "converge: order creation failed");
+                            state.circuit_breaker.record_error();
+                            state.order_tracker.on_status_update(
+                                &external_id, OrderStatus::Rejected,
+                                None, None, None, None,
+                            );
+                            false
+                        }
+                    }
+                }
+            }).collect();
+
+            let results = futures_util::future::join_all(order_futs).await;
+            let reject_count = results.iter().filter(|&&ok| !ok).count();
+            if reject_count == 0 {
+                self.consecutive_rejects = 0;
+            } else {
+                self.consecutive_rejects += 1;
+                warn!(rejects = reject_count, total = results.len(), consecutive = self.consecutive_rejects, "converge: partial or full order rejection");
+            }
+        }
+
+        // Cancel extra orders individually (fire-and-forget)
+        if !cancel_eids.is_empty() {
+            let cancel_futs: Vec<_> = cancel_eids.iter().map(|eid| {
+                let state = &self.state;
+                let exchange_id = eid.clone();
+                async move {
+                    match state.adapter.cancel_order(&exchange_id).await {
+                        Ok(ack) => {
+                            if ack.success {
+                                if let Some(ext_id) = state.order_tracker.resolve_exchange_id(&exchange_id) {
+                                    state.order_tracker.on_status_update(
+                                        &ext_id, OrderStatus::Cancelled, None, None, None, None,
+                                    );
+                                }
+                            } else {
+                                warn!(exchange_id = %exchange_id, "converge: extra order cancel failed");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, exchange_id = %exchange_id, "converge: extra order cancel error");
+                        }
+                    }
+                }
+            }).collect();
+            futures_util::future::join_all(cancel_futs).await;
         }
     }
 
