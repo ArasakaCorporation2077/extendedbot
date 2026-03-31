@@ -1114,11 +1114,12 @@ impl MarketBot {
                 }
                 // Need cancel-replace
                 let exchange_id = live.exchange_id.clone().unwrap(); // safe: filtered above
-                debug!(
-                    external_id = %live.external_id,
+                info!(
+                    old_ext_id = %live.external_id,
+                    old_exchange_id = %exchange_id,
                     old_price = %live.price,
                     new_price = %desired.price,
-                    "converge: replacing bid order"
+                    "converge: replacing bid — expecting CANCELLED WS event for old order"
                 );
                 if let Some(req) = self.prepare_order_with_batch_exposure(
                     market, Side::Buy, desired.price, desired.size, quotes.reduce_only,
@@ -1159,11 +1160,12 @@ impl MarketBot {
                     continue;
                 }
                 let exchange_id = live.exchange_id.clone().unwrap();
-                debug!(
-                    external_id = %live.external_id,
+                info!(
+                    old_ext_id = %live.external_id,
+                    old_exchange_id = %exchange_id,
                     old_price = %live.price,
                     new_price = %desired.price,
-                    "converge: replacing ask order"
+                    "converge: replacing ask — expecting CANCELLED WS event for old order"
                 );
                 if let Some(req) = self.prepare_order_with_batch_exposure(
                     market, Side::Sell, desired.price, desired.size, quotes.reduce_only,
@@ -1462,6 +1464,15 @@ impl MarketBot {
             }
         }
 
+        if status.is_terminal() {
+            info!(
+                id = %external_id,
+                exchange_id = ?exchange_id,
+                status = %status,
+                "Order terminal — WS confirmed"
+            );
+        }
+
         self.state.order_tracker.on_status_update(
             &external_id,
             status,
@@ -1470,10 +1481,6 @@ impl MarketBot {
             remaining_qty,
             avg_fill_price,
         );
-
-        if status.is_terminal() {
-            debug!(id = %external_id, status = %status, "Order terminal");
-        }
     }
 
     /// Resolve external_id: if empty, look up via exchange_id in order tracker.
