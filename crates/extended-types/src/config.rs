@@ -149,6 +149,20 @@ pub struct TradingConfig {
     /// Max fair-price shift in bps when depth imbalance = 1.0 (default 1.5).
     #[serde(default = "default_depth_imbalance_sensitivity")]
     pub depth_imbalance_sensitivity_bps: f64,
+
+    // Aggressive/reducing quoting
+    /// Minimum edge in bps vs Binance mid to quote the inventory-opening (aggressive) side.
+    #[serde(default = "default_aggressive_edge_bps")]
+    pub aggressive_edge_bps: f64,
+    /// Maximum spread for the inventory-reducing side when the position is freshly opened.
+    #[serde(default = "default_reducing_max_spread_bps")]
+    pub reducing_max_spread_bps: f64,
+    /// Minimum spread for the inventory-reducing side after the decay period.
+    #[serde(default = "default_reducing_min_spread_bps")]
+    pub reducing_min_spread_bps: f64,
+    /// Seconds until the reducing-side spread reaches its minimum (linear decay).
+    #[serde(default = "default_reducing_decay_s")]
+    pub reducing_decay_s: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -204,6 +218,10 @@ fn default_hard_one_side_ratio() -> f64 { 0.70 }
 fn default_trade_flow_window() -> f64 { 5.0 }
 fn default_trade_flow_sensitivity() -> f64 { 1.0 }
 fn default_depth_imbalance_sensitivity() -> f64 { 1.5 }
+fn default_aggressive_edge_bps() -> f64 { 2.0 }
+fn default_reducing_max_spread_bps() -> f64 { 4.0 }
+fn default_reducing_min_spread_bps() -> f64 { 1.0 }
+fn default_reducing_decay_s() -> f64 { 30.0 }
 fn default_max_daily_loss() -> Decimal { Decimal::new(500, 0) }
 fn default_max_orders_per_min() -> u32 { 200 }
 fn default_max_errors_per_min() -> u32 { 10 }

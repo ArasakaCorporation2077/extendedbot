@@ -68,6 +68,14 @@ depth_imbalance_sensitivity_bps = 0.3
 one_side_inventory_ratio = 0.45
 hard_one_side_inventory_ratio = 0.70
 
+# Aggressive/reducing quoting (beatzxbt pattern)
+# aggressive_edge_bps: minimum edge vs Binance to open new inventory
+# reducing_*: spread decay for the inventory-closing side
+aggressive_edge_bps = 2.0
+reducing_max_spread_bps = 4.0
+reducing_min_spread_bps = 1.0
+reducing_decay_s = 30.0
+
 [risk]
 max_position_usd = 80.0
 max_daily_loss_usd = 500.0

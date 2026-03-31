@@ -93,6 +93,8 @@ pub struct MarketBot {
     order_seq: u64,
     is_requoting: bool,
     basis_ema: Decimal,
+    /// Instant when the current position was first opened (non-zero). None when flat.
+    position_opened_at: Option<Instant>,
 }
 
 impl MarketBot {
@@ -170,6 +172,7 @@ impl MarketBot {
             order_seq: 0,
             is_requoting: false,
             basis_ema: Decimal::ZERO,
+            position_opened_at: None,
         }
     }
 
@@ -268,19 +271,49 @@ impl MarketBot {
                 self.on_fill(&resolved_ext_id, price, qty, fee, is_maker);
                 // Force requote on next eligible cycle to replenish the filled side.
                 self.last_quoted_fp = None;
+                // Start position timer if transitioning from flat to non-flat.
+                if self.position_opened_at.is_none() {
+                    let market = self.state.market().to_string();
+                    let ratio = self.state.position_manager.inventory_ratio(&market);
+                    if ratio.abs() > dec!(0.05) {
+                        self.position_opened_at = Some(Instant::now());
+                    }
+                }
             }
             BotEvent::PositionUpdate { market, size, entry_price, mark_price, .. } => {
                 if market.is_empty() {
                     // Empty market = "all positions closed" from WS empty snapshot.
                     // Reset our market's position to flat.
                     let m = self.state.market().to_string();
+                    let prev_size = self.state.position_manager.get_position(&m)
+                        .map(|p| p.size)
+                        .unwrap_or(Decimal::ZERO);
                     self.state.position_manager.set_position(&m, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
                     self.state.exposure_tracker.update_position(&m, Decimal::ZERO);
-                    info!("Position reset to flat (empty WS snapshot)");
+                    if !prev_size.is_zero() {
+                        self.position_opened_at = None;
+                        info!("Position reset to flat (empty WS snapshot) — clearing position timer");
+                    }
                 } else {
+                    let prev_size = self.state.position_manager.get_position(&market)
+                        .map(|p| p.size)
+                        .unwrap_or(Decimal::ZERO);
                     self.state.position_manager.set_position(&market, size, entry_price, mark_price);
                     let notional = size.abs() * mark_price;
                     self.state.exposure_tracker.update_position(&market, notional * size.signum());
+
+                    // Track when position transitions from flat to non-flat or back.
+                    if market == self.state.market() {
+                        let was_flat = prev_size.abs() < dec!(0.0001);
+                        let is_flat = size.abs() < dec!(0.0001);
+                        if was_flat && !is_flat {
+                            self.position_opened_at = Some(Instant::now());
+                            info!(size = %size, "Position opened — starting reducing timer");
+                        } else if !was_flat && is_flat {
+                            self.position_opened_at = None;
+                            info!("Position closed — resetting reducing timer");
+                        }
+                    }
                 }
             }
             BotEvent::BalanceUpdate { available, total_equity, .. } => {
@@ -554,6 +587,39 @@ impl MarketBot {
         }
     }
 
+    /// Compute the reducing-side spread (bps) using linear decay from max to min over `decay_s`.
+    fn reducing_spread_bps(&self, position_age_s: f64) -> Decimal {
+        let tc = &self.state.config.trading;
+        let max = tc.reducing_max_spread_bps;
+        let min = tc.reducing_min_spread_bps;
+        let decay = tc.reducing_decay_s.max(1.0); // guard against zero
+        let t = position_age_s.min(decay);
+        let spread = max - (max - min) * (t / decay);
+        Decimal::try_from(spread).unwrap_or(dec!(2.0))
+    }
+
+    /// Returns true if there is sufficient edge on `side` vs Binance mid to justify
+    /// quoting the inventory-opening (aggressive) side.
+    fn has_aggressive_edge(&self, side: Side, quote_price: Decimal) -> bool {
+        let threshold_f = self.state.config.trading.aggressive_edge_bps;
+        let threshold = Decimal::try_from(threshold_f).unwrap_or(dec!(2.0));
+        let bn_mid = match *self.state.binance_mid.read() {
+            Some(m) if !m.is_zero() => m,
+            _ => return true, // No Binance data → allow quoting (safe fallback)
+        };
+        let edge = match side {
+            Side::Buy => {
+                // Edge to buy: how much cheaper our bid is vs Binance mid
+                ((bn_mid - quote_price) / bn_mid) * dec!(10000)
+            }
+            Side::Sell => {
+                // Edge to sell: how much more expensive our ask is vs Binance mid
+                ((quote_price - bn_mid) / bn_mid) * dec!(10000)
+            }
+        };
+        edge >= threshold
+    }
+
     async fn requote(&mut self, fair_price: Decimal, tick_time: Instant) {
         if self.is_requoting {
             debug!("Requote already in progress — skipping overlapping call");
@@ -612,46 +678,20 @@ impl MarketBot {
         // Calculate skew
         let skew = self.skew_calc.calculate(inventory_ratio, fair_price);
 
-        // Determine active side based on inventory + basis filter + time filter
+        // Basis EMA update (used for basis filter below)
         let tc = &self.state.config.trading;
-        let hard_ratio = Decimal::try_from(tc.hard_one_side_inventory_ratio).unwrap_or(dec!(0.70));
-
-        let mut active_side = if inventory_ratio.abs() > hard_ratio {
-            if inventory_ratio > Decimal::ZERO { ActiveSide::AskOnly } else { ActiveSide::BidOnly }
-        } else {
-            ActiveSide::Both
-        };
-
-        // Basis filter: block the side that loses when basis deviates significantly from its EMA.
-        // Uses EMA to track structural basis, only blocks on sudden deviations (>10bps).
-        // ONLY applies when flat (no inventory). When holding a position,
-        // the unwind side must never be blocked — otherwise positions get stuck.
         let x10_mid = self.state.orderbook.mid().unwrap_or(Decimal::ZERO);
         let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
         if !bn_mid.is_zero() && !x10_mid.is_zero() {
             let current_basis_bps = ((x10_mid - bn_mid) / bn_mid) * dec!(10000);
-            // Update rolling EMA of basis (slow tracking of structural basis)
             if self.basis_ema.is_zero() {
-                self.basis_ema = current_basis_bps; // initialize
+                self.basis_ema = current_basis_bps;
             } else {
                 self.basis_ema = self.basis_ema * dec!(0.99) + current_basis_bps * dec!(0.01);
-            }
-            let basis_deviation = (current_basis_bps - self.basis_ema).abs();
-
-            let is_flat = inventory_ratio.abs() < dec!(0.05);
-            if active_side == ActiveSide::Both && is_flat && basis_deviation > dec!(10) {
-                if current_basis_bps > self.basis_ema {
-                    active_side = ActiveSide::AskOnly;
-                    info!(basis_deviation = %basis_deviation, "Basis filter → AskOnly (sudden premium)");
-                } else {
-                    active_side = ActiveSide::BidOnly;
-                    info!(basis_deviation = %basis_deviation, "Basis filter → BidOnly (sudden discount)");
-                }
             }
         }
 
         // Time filter: add fixed bps during toxic hours instead of multiplying.
-        // Multiplying was causing inventory_spread to double → unwind impossible.
         let hour_utc = chrono::Utc::now().hour();
         let toxic_hours = (11..=14).contains(&hour_utc);
         let toxic_extra_bps = if toxic_hours { dec!(2.0) } else { Decimal::ZERO };
@@ -660,10 +700,6 @@ impl MarketBot {
             half_spread: spread.half_spread + toxic_extra_half,
             spread_bps: spread.spread_bps + toxic_extra_bps,
         };
-
-        // Unwind acceleration: when holding a position, reduce margin on the unwind side
-        // so it sits closer to BBO and fills faster. Prevents holding positions too long.
-        let ask_spread_offset = Decimal::ZERO; // No asymmetric spread — was causing sell to never fill
 
         // Get exchange BBO
         let exchange_best_bid = self.state.orderbook.best_bid().map(|l| l.price);
@@ -677,14 +713,6 @@ impl MarketBot {
             dec!(0.001)
         };
 
-        // Asymmetric skew: widen ask by sell_extra (regression: sell 1.44bps worse than buy)
-        let adjusted_skew = SkewResult {
-            bid_price_offset: skew.bid_price_offset,
-            ask_price_offset: skew.ask_price_offset + ask_spread_offset * fair_price,
-            bid_size_mult: skew.bid_size_mult,
-            ask_size_mult: skew.ask_size_mult,
-        };
-
         // Dynamic margin: when holding position, set margin to 0 on unwind side
         // so it sits at BBO front → fills within 1 second instead of holding for minutes.
         let base_margin = Decimal::try_from(tc.best_price_margin_bps).unwrap_or(dec!(1.0));
@@ -694,26 +722,166 @@ impl MarketBot {
             self.quote_gen.set_margin_bps(base_margin);
         }
 
-        let input = QuoteInput {
-            fair_price,
-            spread,
-            skew: adjusted_skew,
-            active_side,
-            base_size,
-            size_multiplier: Decimal::ONE,
-            exchange_best_bid,
-            exchange_best_ask,
+        // ── Aggressive / reducing quote logic ──────────────────────────────────
+        //
+        // Aggressive side: opening new inventory. Only quote when edge vs Binance
+        // exceeds `aggressive_edge_bps`. Hard inventory cap still blocks completely
+        // via `active_side`.
+        //
+        // Reducing side: closing existing inventory. Always quote while holding;
+        // spread decays from `reducing_max_spread_bps` → `reducing_min_spread_bps`
+        // over `reducing_decay_s` seconds to pressure an exit over time.
+        //
+        // When flat both sides are aggressive and subject to the edge filter.
+        // Basis filter (sudden premium/discount) still applies when flat.
+
+        let hard_ratio = Decimal::try_from(tc.hard_one_side_inventory_ratio).unwrap_or(dec!(0.70));
+        let is_long  = inventory_ratio >  dec!(0.05);
+        let is_short = inventory_ratio < dec!(-0.05);
+
+        // Position age for reducing-spread decay
+        let position_age_s = self.position_opened_at
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        let reducing_spread_bps = self.reducing_spread_bps(position_age_s);
+        let reducing_half = extended_types::decimal_utils::bps_to_ratio(reducing_spread_bps) / dec!(2);
+        let reducing_spread = SpreadResult {
+            half_spread: reducing_half,
+            spread_bps: reducing_spread_bps,
         };
 
-        let quotes = self.quote_gen.generate(&input);
+        // Helper: generate quotes for one side using a given SpreadResult.
+        // We generate both sides using QuoteGenerator and pick the side we need.
+        let gen_quotes_for_side = |qg: &QuoteGenerator, sp: &SpreadResult, active: ActiveSide| {
+            let input = QuoteInput {
+                fair_price,
+                spread: SpreadResult { half_spread: sp.half_spread, spread_bps: sp.spread_bps },
+                skew: SkewResult {
+                    bid_price_offset: skew.bid_price_offset,
+                    ask_price_offset: skew.ask_price_offset,
+                    bid_size_mult: skew.bid_size_mult,
+                    ask_size_mult: skew.ask_size_mult,
+                },
+                active_side: active,
+                base_size,
+                size_multiplier: Decimal::ONE,
+                exchange_best_bid,
+                exchange_best_ask,
+            };
+            qg.generate(&input)
+        };
+
+        // Compute the bid and ask quote prices that would result from the normal spread,
+        // so we can pass them to has_aggressive_edge().
+        let normal_bid_price = fair_price * (Decimal::ONE - spread.half_spread) + skew.bid_price_offset;
+        let normal_ask_price = fair_price * (Decimal::ONE + spread.half_spread) + skew.ask_price_offset;
+
+        let (final_bids, final_asks) = if inventory_ratio.abs() > hard_ratio {
+            // Hard cap: only quote the unwind side regardless of mode.
+            if inventory_ratio > Decimal::ZERO {
+                // Very long → only ask (reducing), no bid.
+                let q = gen_quotes_for_side(&self.quote_gen, &reducing_spread, ActiveSide::AskOnly);
+                (vec![], q.asks)
+            } else {
+                // Very short → only bid (reducing), no ask.
+                let q = gen_quotes_for_side(&self.quote_gen, &reducing_spread, ActiveSide::BidOnly);
+                (q.bids, vec![])
+            }
+        } else if is_long {
+            // Ask = reducing (always quote, spread decays)
+            let q_ask = gen_quotes_for_side(&self.quote_gen, &reducing_spread, ActiveSide::AskOnly);
+
+            // Bid = aggressive (only if edge exists)
+            let bid_quotes = if self.has_aggressive_edge(Side::Buy, normal_bid_price) {
+                let q = gen_quotes_for_side(&self.quote_gen, &spread, ActiveSide::BidOnly);
+                q.bids
+            } else {
+                vec![]
+            };
+
+            (bid_quotes, q_ask.asks)
+        } else if is_short {
+            // Bid = reducing (always quote, spread decays)
+            let q_bid = gen_quotes_for_side(&self.quote_gen, &reducing_spread, ActiveSide::BidOnly);
+
+            // Ask = aggressive (only if edge exists)
+            let ask_quotes = if self.has_aggressive_edge(Side::Sell, normal_ask_price) {
+                let q = gen_quotes_for_side(&self.quote_gen, &spread, ActiveSide::AskOnly);
+                q.asks
+            } else {
+                vec![]
+            };
+
+            (q_bid.bids, ask_quotes)
+        } else {
+            // Flat: both sides are aggressive — apply basis filter then edge filter.
+            let mut bid_active = true;
+            let mut ask_active = true;
+
+            // Basis filter: block the disadvantaged side on sudden basis deviation.
+            if !bn_mid.is_zero() && !x10_mid.is_zero() {
+                let current_basis_bps = ((x10_mid - bn_mid) / bn_mid) * dec!(10000);
+                let basis_deviation = (current_basis_bps - self.basis_ema).abs();
+                if basis_deviation > dec!(10) {
+                    if current_basis_bps > self.basis_ema {
+                        ask_active = false;
+                        info!(basis_deviation = %basis_deviation, "Basis filter (flat) → no ask (sudden premium)");
+                    } else {
+                        bid_active = false;
+                        info!(basis_deviation = %basis_deviation, "Basis filter (flat) → no bid (sudden discount)");
+                    }
+                }
+            }
+
+            // Edge filter: only quote each side if we have edge vs Binance.
+            if bid_active && !self.has_aggressive_edge(Side::Buy, normal_bid_price) {
+                bid_active = false;
+                debug!("Flat bid suppressed — insufficient aggressive edge");
+            }
+            if ask_active && !self.has_aggressive_edge(Side::Sell, normal_ask_price) {
+                ask_active = false;
+                debug!("Flat ask suppressed — insufficient aggressive edge");
+            }
+
+            let bids = if bid_active {
+                gen_quotes_for_side(&self.quote_gen, &spread, ActiveSide::BidOnly).bids
+            } else { vec![] };
+            let asks = if ask_active {
+                gen_quotes_for_side(&self.quote_gen, &spread, ActiveSide::AskOnly).asks
+            } else { vec![] };
+
+            (bids, asks)
+        };
+
+        // Preserve legacy hard-cap: if skew zeroed out a size multiplier entirely,
+        // those levels will already be empty (QuoteGenerator filters size < min_qty).
+        // Nothing extra needed here.
+
+        let quotes = GeneratedQuotes {
+            bids: final_bids,
+            asks: final_asks,
+            reduce_only: false,
+        };
+
+        // Derive active_side label for logging
+        let logged_side = match (quotes.bids.is_empty(), quotes.asks.is_empty()) {
+            (false, false) => "Both",
+            (true,  false) => "AskOnly",
+            (false, true)  => "BidOnly",
+            (true,  true)  => "None",
+        };
 
         info!(
             bids = quotes.bids.len(),
             asks = quotes.asks.len(),
             reduce_only = quotes.reduce_only,
-            active_side = ?active_side,
+            active_side = logged_side,
             inventory_ratio = %inventory_ratio,
             base_size = %base_size,
+            is_long,
+            is_short,
+            position_age_s,
+            reducing_spread_bps = %reducing_spread_bps,
             "Quote generation result — converging orders"
         );
 
