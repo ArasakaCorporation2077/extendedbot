@@ -544,12 +544,13 @@ async fn bootstrap_state(state: &Arc<BotState>) -> Result<()> {
                 let ext_id = o.external_id.clone().unwrap_or(o.id.clone());
                 state.order_tracker.on_rest_response(&ext_id, Some(o.id.clone()));
                 let filled = o.filled_qty.as_ref().and_then(|s| s.parse::<Decimal>().ok());
+                let remaining = o.remaining_qty.as_ref().and_then(|s| s.parse::<Decimal>().ok());
                 state.order_tracker.on_status_update(
                     &ext_id,
                     extended_types::order::OrderStatus::Open,
                     Some(o.id.clone()),
                     filled,
-                    o.remaining_qty,
+                    remaining,
                     None,
                 );
             }

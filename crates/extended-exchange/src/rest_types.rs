@@ -153,7 +153,7 @@ pub struct OrderResponse {
     #[serde(default)]
     pub cancelled_qty: Option<String>,
     #[serde(default)]
-    pub remaining_qty: Option<Decimal>,
+    pub remaining_qty: Option<String>,
     pub status: String,
     #[serde(default)]
     pub post_only: Option<bool>,

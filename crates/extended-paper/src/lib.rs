@@ -310,7 +310,7 @@ impl ExchangeAdapter for PaperExchange {
                 qty: o.qty,
                 filled_qty: Some(o.filled_qty.to_string()),
                 cancelled_qty: None,
-                remaining_qty: Some(o.qty - o.filled_qty),
+                remaining_qty: Some((o.qty - o.filled_qty).to_string()),
                 status: "open".into(),
                 post_only: Some(true),
                 reduce_only: Some(o.reduce_only),

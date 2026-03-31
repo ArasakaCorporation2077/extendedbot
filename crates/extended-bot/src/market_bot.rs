@@ -1557,16 +1557,22 @@ impl MarketBot {
                 }
 
                 // 2. Orphan orders: on exchange but not in tracker → cancel them
+                // Grace period: only cancel if order is >10s old to avoid killing just-placed orders.
+                let now_ms = chrono::Utc::now().timestamp_millis() as u64;
                 for eo in &exchange_orders {
                     if !tracked_eids.contains(&eo.id) {
-                        warn!(
-                            exchange_id = %eo.id,
-                            price = %eo.price,
-                            side = %eo.side,
-                            "Orphan order on exchange (not in tracker) — cancelling"
-                        );
-                        if let Err(e) = self.state.adapter.cancel_order(&eo.id).await {
-                            warn!(error = %e, exchange_id = %eo.id, "Failed to cancel orphan order");
+                        let age_ms = eo.created_time.map(|ct| now_ms.saturating_sub(ct)).unwrap_or(u64::MAX);
+                        if age_ms > 10_000 {
+                            warn!(
+                                exchange_id = %eo.id,
+                                price = %eo.price,
+                                side = %eo.side,
+                                age_ms,
+                                "Orphan order on exchange (not in tracker) — cancelling"
+                            );
+                            if let Err(e) = self.state.adapter.cancel_order(&eo.id).await {
+                                warn!(error = %e, exchange_id = %eo.id, "Failed to cancel orphan order");
+                            }
                         }
                     }
                 }
