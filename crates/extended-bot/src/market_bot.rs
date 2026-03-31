@@ -1112,20 +1112,24 @@ impl MarketBot {
                     );
                     continue; // leave this order alone
                 }
-                // Need cancel-replace
-                let exchange_id = live.exchange_id.clone().unwrap(); // safe: filtered above
+                // Cancel old + place new (not cancel-replace — WS CANCELLED event is too slow)
+                let exchange_id = live.exchange_id.clone().unwrap();
                 info!(
                     old_ext_id = %live.external_id,
                     old_exchange_id = %exchange_id,
                     old_price = %live.price,
                     new_price = %desired.price,
-                    "converge: replacing bid — expecting CANCELLED WS event for old order"
+                    "converge: cancel old bid + place new"
+                );
+                cancel_eids.push(exchange_id);
+                self.state.order_tracker.on_status_update(
+                    &live.external_id, OrderStatus::Cancelled, None, None, None, None,
                 );
                 if let Some(req) = self.prepare_order_with_batch_exposure(
                     market, Side::Buy, desired.price, desired.size, quotes.reduce_only,
                     &mut batch_bid_usd, &mut batch_ask_usd,
                 ) {
-                    order_reqs.push((req, Some(exchange_id)));
+                    order_reqs.push((req, None));
                 }
             } else {
                 // No matching live order — place new
@@ -1165,13 +1169,17 @@ impl MarketBot {
                     old_exchange_id = %exchange_id,
                     old_price = %live.price,
                     new_price = %desired.price,
-                    "converge: replacing ask — expecting CANCELLED WS event for old order"
+                    "converge: cancel old ask + place new"
+                );
+                cancel_eids.push(exchange_id);
+                self.state.order_tracker.on_status_update(
+                    &live.external_id, OrderStatus::Cancelled, None, None, None, None,
                 );
                 if let Some(req) = self.prepare_order_with_batch_exposure(
                     market, Side::Sell, desired.price, desired.size, quotes.reduce_only,
                     &mut batch_bid_usd, &mut batch_ask_usd,
                 ) {
-                    order_reqs.push((req, Some(exchange_id)));
+                    order_reqs.push((req, None));
                 }
             } else {
                 debug!(price = %desired.price, "converge: placing new ask order");
@@ -1195,30 +1203,16 @@ impl MarketBot {
         // — they will be handled once the exchange_id arrives via WS.
 
         info!(
-            new_orders = order_reqs.iter().filter(|(_, c)| c.is_none()).count(),
-            replacements = order_reqs.iter().filter(|(_, c)| c.is_some()).count(),
+            new_orders = order_reqs.len(),
             extra_cancels = cancel_eids.len(),
             "converge_orders: plan"
         );
 
-        // Send new/replacement orders in parallel
+        // Send new orders in parallel (no cancel_id — plain new orders only)
         if !order_reqs.is_empty() {
-            // Attach cancel_id to replacement requests
-            let prepared: Vec<OrderRequest> = order_reqs.iter().map(|(req, cancel_id)| {
-                let mut r = req.clone();
-                r.cancel_id = cancel_id.clone();
-                r
-            }).collect();
-
-            // Keep (external_id, cancel_id) for post-processing
-            let id_map: Vec<(String, Option<String>)> = order_reqs.iter()
-                .map(|(req, cancel_id)| (req.external_id.clone(), cancel_id.clone()))
-                .collect();
-
-            let order_futs: Vec<_> = prepared.iter().zip(id_map.iter()).map(|(req, (ext_id, cancel_id))| {
+            let order_futs: Vec<_> = order_reqs.iter().map(|(req, _)| {
                 let state = &self.state;
-                let external_id = ext_id.clone();
-                let old_cancel_id = cancel_id.clone();
+                let external_id = req.external_id.clone();
                 async move {
                     let t0 = Instant::now();
                     match state.adapter.create_order(req).await {
@@ -1245,30 +1239,6 @@ impl MarketBot {
                             let rtt = t0.elapsed().as_micros() as u64;
                             state.latency.record_order_rtt(rtt);
                             state.latency.record_tick_to_trade(tick_time.elapsed().as_micros() as u64);
-
-                            // If cancel-replace failed (e.g. "Edit order not found"),
-                            // retry without cancel_id as a plain new order.
-                            if old_cancel_id.is_some() {
-                                warn!(error = %e, id = %external_id, "converge: cancel-replace failed, retrying as new order");
-                                // Mark old order as cancelled in tracker (it's gone from exchange)
-                                if let Some(old_eid) = &old_cancel_id {
-                                    if let Some(old_ext) = state.order_tracker.resolve_exchange_id(old_eid) {
-                                        state.order_tracker.on_status_update(
-                                            &old_ext, OrderStatus::Cancelled, None, None, None, None,
-                                        );
-                                    }
-                                }
-                                // Retry without cancel_id
-                                let mut retry_req = req.clone();
-                                retry_req.cancel_id = None;
-                                match state.adapter.create_order(&retry_req).await {
-                                    Ok(ack) if ack.accepted => {
-                                        state.order_tracker.on_rest_response(&external_id, ack.exchange_id);
-                                        return true;
-                                    }
-                                    _ => {} // fall through to rejection below
-                                }
-                            }
 
                             error!(error = %e, id = %external_id, "converge: order creation failed");
                             state.circuit_breaker.record_error();
