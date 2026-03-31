@@ -158,11 +158,27 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
         }
 
         // 4b. Always mass-cancel stale orders at startup (clean slate).
-        match state.adapter.mass_cancel(state.market()).await {
-            Ok(_) => info!("Startup: mass cancel sent (clean slate)"),
-            Err(e) => warn!(error = %e, "Startup: mass cancel failed"),
+        // Retry until exchange confirms 0 open orders.
+        for attempt in 0..3 {
+            match state.adapter.mass_cancel(state.market()).await {
+                Ok(_) => info!("Startup: mass cancel sent (attempt {})", attempt + 1),
+                Err(e) => warn!(error = %e, "Startup: mass cancel failed"),
+            }
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            match state.adapter.get_open_orders(Some(state.market())).await {
+                Ok(orders) if orders.is_empty() => {
+                    info!("Startup: confirmed 0 open orders — clean slate");
+                    break;
+                }
+                Ok(orders) => {
+                    warn!(count = orders.len(), "Startup: still {} orders after cancel, retrying", orders.len());
+                }
+                Err(e) => {
+                    warn!(error = %e, "Startup: failed to check open orders");
+                    break; // can't verify, proceed anyway
+                }
+            }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // 4c. Auto-flatten if existing position exceeds max_position_usd at startup.
         //     This prevents the bot from being stuck unable to quote after a restart
@@ -527,11 +543,12 @@ async fn bootstrap_state(state: &Arc<BotState>) -> Result<()> {
                 state.order_tracker.add_order(&req);
                 let ext_id = o.external_id.clone().unwrap_or(o.id.clone());
                 state.order_tracker.on_rest_response(&ext_id, Some(o.id.clone()));
+                let filled = o.filled_qty.as_ref().and_then(|s| s.parse::<Decimal>().ok());
                 state.order_tracker.on_status_update(
                     &ext_id,
                     extended_types::order::OrderStatus::Open,
                     Some(o.id.clone()),
-                    o.filled_qty,
+                    filled,
                     o.remaining_qty,
                     None,
                 );

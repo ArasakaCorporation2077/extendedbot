@@ -140,7 +140,6 @@ pub struct PositionResponse {
 pub struct OrderResponse {
     #[serde(deserialize_with = "deserialize_string_from_any")]
     pub id: String,
-    #[serde(alias = "externalId")]
     pub external_id: Option<String>,
     pub market: String,
     pub side: String,
@@ -149,15 +148,24 @@ pub struct OrderResponse {
     pub price: Decimal,
     #[serde(deserialize_with = "deserialize_decimal_from_str")]
     pub qty: Decimal,
-    pub filled_qty: Option<Decimal>,
+    #[serde(default)]
+    pub filled_qty: Option<String>,
+    #[serde(default)]
+    pub cancelled_qty: Option<String>,
+    #[serde(default)]
     pub remaining_qty: Option<Decimal>,
     pub status: String,
+    #[serde(default)]
     pub post_only: Option<bool>,
+    #[serde(default)]
     pub reduce_only: Option<bool>,
     pub time_in_force: Option<String>,
-    #[serde(alias = "createdAt", alias = "createdTime")]
-    pub created_at: Option<String>,
-    // Additional fields from actual API that we don't use
+    #[serde(default)]
+    pub created_time: Option<u64>,
+    #[serde(default)]
+    pub updated_time: Option<u64>,
+    #[serde(default)]
+    pub expire_time: Option<u64>,
     #[serde(default)]
     pub average_price: Option<String>,
     #[serde(default)]

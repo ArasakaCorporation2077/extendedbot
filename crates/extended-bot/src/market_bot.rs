@@ -268,7 +268,32 @@ impl MarketBot {
 
                 // P0-7 FIX: Markout recording moved to on_order_update (FILLED status)
                 // to avoid double-counting. Fill events are unreliable on x10.
+                let is_unknown = self.state.order_tracker.get_by_external_id(&resolved_ext_id).is_none();
                 self.on_fill(&resolved_ext_id, price, qty, fee, is_maker);
+
+                // If this was an unknown order fill, re-sync position from REST.
+                if is_unknown {
+                    warn!("Unknown fill detected — re-syncing position from REST");
+                    if let Ok(positions) = self.state.adapter.get_positions().await {
+                        for pos in &positions {
+                            if pos.market == self.state.market() {
+                                let signed = match pos.side.as_deref() {
+                                    Some("SHORT") => -pos.size.abs(),
+                                    _ => pos.size.abs(),
+                                };
+                                let mark = pos.mark_price.unwrap_or(pos.entry_price);
+                                self.state.position_manager.set_position(&pos.market, signed, pos.entry_price, mark);
+                                info!(market = %pos.market, size = %signed, "Position re-synced from REST after unknown fill");
+                            }
+                        }
+                        if positions.iter().all(|p| p.market != self.state.market()) {
+                            let m = self.state.market().to_string();
+                            self.state.position_manager.set_position(&m, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+                            info!("Position reset to flat (no position in REST after unknown fill)");
+                        }
+                    }
+                }
+
                 // Force requote on next eligible cycle to replenish the filled side.
                 self.last_quoted_fp = None;
                 // Start position timer if transitioning from flat to non-flat.
