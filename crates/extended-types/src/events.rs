@@ -87,6 +87,10 @@ pub enum BotEvent {
         received_at: Instant,
     },
 
+    /// Full snapshot of all open orders from the exchange (WS isSnapshot=true).
+    /// Used to sync the order tracker — any tracked order NOT in this list is stale.
+    OrderSnapshot { exchange_ids: Vec<String> },
+
     // -- Internal signals --
     CircuitBreakerTrip {
         reason: String,

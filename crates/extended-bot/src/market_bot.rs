@@ -355,6 +355,36 @@ impl MarketBot {
                     "Dynamic sizing updated"
                 );
             }
+            BotEvent::OrderSnapshot { exchange_ids } => {
+                // Compare tracker's live orders against the exchange snapshot.
+                // Any tracked order with an exchange_id NOT in the snapshot is a ghost.
+                let tracked = self.state.order_tracker.live_orders(self.state.market());
+                let snapshot_set: std::collections::HashSet<&str> =
+                    exchange_ids.iter().map(|s| s.as_str()).collect();
+                let mut cleaned = 0usize;
+                for t in &tracked {
+                    if let Some(eid) = &t.exchange_id {
+                        if !snapshot_set.contains(eid.as_str()) && t.age_ms() > 5_000 {
+                            // Ghost order: in tracker but not on exchange.
+                            self.state.order_tracker.on_status_update(
+                                &t.external_id,
+                                OrderStatus::Cancelled,
+                                None, None, None, None,
+                            );
+                            cleaned += 1;
+                            warn!(
+                                external_id = %t.external_id,
+                                exchange_id = %eid,
+                                age_ms = t.age_ms(),
+                                "WS snapshot: ghost order cleaned from tracker"
+                            );
+                        }
+                    }
+                }
+                if cleaned > 0 {
+                    info!(cleaned, snapshot_size = exchange_ids.len(), "WS snapshot: cleaned ghost orders from tracker");
+                }
+            }
             BotEvent::CircuitBreakerTrip { reason } => {
                 warn!(reason = %reason, "Circuit breaker tripped from event");
                 self.state.circuit_breaker.trip(&reason);

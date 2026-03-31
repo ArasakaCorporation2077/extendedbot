@@ -351,7 +351,8 @@ impl ExtendedWebSocket {
                         warn!("Private WS SNAPSHOT received with empty orders array — ignoring to prevent ghost order accumulation");
                         // positions/trades/balance from this snapshot are still processed below
                     } else {
-                        for update in orders {
+                        let is_snapshot = msg_type == "SNAPSHOT";
+                        for update in &orders {
                             let status = parse_order_status(&update.status);
                             let exchange_id = update.id.map(|id| id.to_string());
                             let remaining = match (&update.filled_qty, &update.qty) {
@@ -359,7 +360,7 @@ impl ExtendedWebSocket {
                                 _ => None,
                             };
                             let _ = event_tx.send(BotEvent::OrderUpdate {
-                                external_id: update.external_id.unwrap_or_default(),
+                                external_id: update.external_id.clone().unwrap_or_default(),
                                 exchange_id,
                                 status,
                                 filled_qty: update.filled_qty,
@@ -367,6 +368,14 @@ impl ExtendedWebSocket {
                                 avg_fill_price: update.average_price,
                                 ts: update.updated_time.or(update.created_time).unwrap_or(0),
                             });
+                        }
+                        // After emitting individual updates, send a snapshot event so the
+                        // order tracker can clean up ghost orders in one pass.
+                        if is_snapshot {
+                            let exchange_ids: Vec<String> = orders.iter()
+                                .filter_map(|o| o.id.map(|id| id.to_string()))
+                                .collect();
+                            let _ = event_tx.send(BotEvent::OrderSnapshot { exchange_ids });
                         }
                     }
                 }
