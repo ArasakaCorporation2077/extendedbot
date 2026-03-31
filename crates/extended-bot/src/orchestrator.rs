@@ -242,8 +242,38 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
                 }
                 // Wait for fill
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                info!("Startup flatten complete");
+                // Reset position_manager to flat after flatten.
+                let market = state.market().to_string();
+                state.position_manager.set_position(&market, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+                state.exposure_tracker.update_position(&market, Decimal::ZERO);
+                info!("Startup flatten complete — position_manager reset to flat");
             }
+        }
+
+        // Final position sync from REST — ensures position_manager matches exchange.
+        match state.adapter.get_positions().await {
+            Ok(positions) => {
+                let market = state.market().to_string();
+                let has_pos = positions.iter().any(|p| p.market == market && p.size != Decimal::ZERO);
+                if !has_pos {
+                    state.position_manager.set_position(&market, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+                    state.exposure_tracker.update_position(&market, Decimal::ZERO);
+                    info!("Startup: position_manager confirmed flat from REST");
+                } else {
+                    for p in &positions {
+                        if p.market == market {
+                            let signed = match p.side.as_deref() {
+                                Some("SHORT") => -p.size.abs(),
+                                _ => p.size.abs(),
+                            };
+                            let mark = p.mark_price.unwrap_or(p.entry_price);
+                            state.position_manager.set_position(&market, signed, p.entry_price, mark);
+                            info!(size = %signed, "Startup: position_manager synced from REST");
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "Startup: failed to sync position from REST"),
         }
     }
 
