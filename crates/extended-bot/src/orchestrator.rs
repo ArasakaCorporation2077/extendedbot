@@ -157,7 +157,14 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
             error!(error = %e, "State bootstrap failed, continuing with defaults");
         }
 
-        // 4b. Auto-flatten if existing position exceeds max_position_usd at startup.
+        // 4b. Always mass-cancel stale orders at startup (clean slate).
+        match state.adapter.mass_cancel(state.market()).await {
+            Ok(_) => info!("Startup: mass cancel sent (clean slate)"),
+            Err(e) => warn!(error = %e, "Startup: mass cancel failed"),
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // 4c. Auto-flatten if existing position exceeds max_position_usd at startup.
         //     This prevents the bot from being stuck unable to quote after a restart
         //     with a large leftover position.
         let max_pos = Decimal::try_from(config.risk.max_position_usd).unwrap_or(dec!(500));
@@ -312,7 +319,7 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
 
     // Periodic tasks
     let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
-    let mut reconcile_interval = tokio::time::interval(Duration::from_secs(60));
+    let mut reconcile_interval = tokio::time::interval(Duration::from_secs(30));
     let mut markout_tick = tokio::time::interval(Duration::from_millis(50));
     let mut dms_interval = tokio::time::interval(Duration::from_secs(
         (config.trading.dead_man_switch_timeout_ms / 3000).max(10),

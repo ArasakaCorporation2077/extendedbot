@@ -1513,7 +1513,11 @@ impl MarketBot {
                 let tracked = self.state.order_tracker.live_orders(self.state.market());
                 let exchange_ids: std::collections::HashSet<String> =
                     exchange_orders.iter().map(|o| o.id.clone()).collect();
+                let tracked_eids: std::collections::HashSet<String> = tracked.iter()
+                    .filter_map(|t| t.exchange_id.clone())
+                    .collect();
 
+                // 1. Ghost orders: in tracker but not on exchange → mark cancelled
                 for t in &tracked {
                     if let Some(eid) = &t.exchange_id {
                         if !exchange_ids.contains(eid) && t.age_ms() > 30_000 {
@@ -1525,6 +1529,29 @@ impl MarketBot {
                             );
                         }
                     }
+                }
+
+                // 2. Orphan orders: on exchange but not in tracker → cancel them
+                for eo in &exchange_orders {
+                    if !tracked_eids.contains(&eo.id) {
+                        warn!(
+                            exchange_id = %eo.id,
+                            price = %eo.price,
+                            side = %eo.side,
+                            "Orphan order on exchange (not in tracker) — cancelling"
+                        );
+                        if let Err(e) = self.state.adapter.cancel_order(&eo.id).await {
+                            warn!(error = %e, exchange_id = %eo.id, "Failed to cancel orphan order");
+                        }
+                    }
+                }
+
+                if !exchange_orders.is_empty() || !tracked.is_empty() {
+                    info!(
+                        exchange = exchange_orders.len(),
+                        tracker = tracked.len(),
+                        "Reconciliation complete"
+                    );
                 }
             }
             Err(e) => {
