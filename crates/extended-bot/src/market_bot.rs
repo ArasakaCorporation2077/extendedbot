@@ -1031,6 +1031,24 @@ impl MarketBot {
         let tick_size = *self.state.tick_size.read();
         let live_orders = self.state.order_tracker.live_orders(market);
 
+        // Stale tracker detection: if tracker has orders but they're all old (>30s)
+        // and converge keeps skipping, force-cancel all and clear tracker.
+        // This catches ghost orders that reconcile failed to clean up.
+        if !live_orders.is_empty() {
+            let all_stale = live_orders.iter().all(|o| o.age_ms() > 30_000);
+            if all_stale {
+                warn!(count = live_orders.len(), "Stale tracker detected — force clearing ghost orders");
+                for o in &live_orders {
+                    self.state.order_tracker.on_status_update(
+                        &o.external_id, OrderStatus::Cancelled, None, None, None, None,
+                    );
+                }
+                // Also mass_cancel on exchange just in case
+                let _ = self.state.adapter.mass_cancel(market).await;
+                return; // next cycle will see clean tracker and place fresh orders
+            }
+        }
+
         // Partition live orders by side. Only include orders that have an exchange_id
         // (confirmed by exchange) and are NOT already pending cancel.
         let mut live_bids: Vec<_> = live_orders.iter()
