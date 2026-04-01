@@ -7,9 +7,9 @@ user_agent = "extended-mm/0.1.0"
 
 [trading]
 market = "ETH-USD"
-order_size_usd = 25.0
-min_order_usd = 20.0
-max_order_usd = 30.0
+order_size_usd = 30.0
+min_order_usd = 25.0
+max_order_usd = 40.0
 leverage = 5
 
 # Expiry: mainnet supports up to 90 days
