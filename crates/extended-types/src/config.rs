@@ -163,6 +163,17 @@ pub struct TradingConfig {
     /// Seconds until the reducing-side spread reaches its minimum (linear decay).
     #[serde(default = "default_reducing_decay_s")]
     pub reducing_decay_s: f64,
+
+    // ROC (Rate of Change) guard
+    /// Rolling window in ms for price-velocity check (default 10000 = 10s).
+    #[serde(default = "default_roc_window_ms")]
+    pub roc_window_ms: u64,
+    /// Trigger threshold in bps: pause quoting if price moves this much within the window.
+    #[serde(default = "default_roc_threshold_bps")]
+    pub roc_threshold_bps: f64,
+    /// How long to pause quoting after trigger, in ms (default 15000 = 15s).
+    #[serde(default = "default_roc_pause_ms")]
+    pub roc_pause_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -227,3 +238,6 @@ fn default_max_orders_per_min() -> u32 { 200 }
 fn default_max_errors_per_min() -> u32 { 10 }
 fn default_stale_price() -> f64 { 5.0 }
 fn default_cooldown() -> u64 { 60 }
+fn default_roc_window_ms() -> u64 { 10_000 }
+fn default_roc_threshold_bps() -> f64 { 30.0 }
+fn default_roc_pause_ms() -> u64 { 15_000 }

@@ -76,6 +76,11 @@ reducing_max_spread_bps = 4.0
 reducing_min_spread_bps = 1.0
 reducing_decay_s = 30.0
 
+# ROC guard: pause quoting when price moves too fast (momentum ignition defence)
+roc_window_ms = 10000
+roc_threshold_bps = 30.0
+roc_pause_ms = 15000
+
 [risk]
 max_position_usd = 80.0
 max_daily_loss_usd = 500.0

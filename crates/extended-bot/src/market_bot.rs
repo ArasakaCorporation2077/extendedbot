@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use extended_risk::fast_cancel::{FastCancel, LiveOrderInfo};
+use extended_risk::RocGuard;
 use extended_strategy::depth_imbalance::DepthImbalanceTracker;
 use extended_strategy::fair_price::FairPriceCalculator;
 use extended_strategy::quote_generator::{ActiveSide, GeneratedQuotes, QuoteGenerator, QuoteInput};
@@ -83,6 +84,7 @@ pub struct MarketBot {
     trade_flow: TradeFlowTracker,
     depth_imbalance: DepthImbalanceTracker,
     fast_cancel: FastCancel,
+    roc_guard: RocGuard,
     last_requote: Instant,
     last_fast_cancel: Option<Instant>,
     last_binance_tick: Option<Instant>,
@@ -151,6 +153,8 @@ impl MarketBot {
             tc.max_order_age_s,
         );
 
+        let roc_guard = RocGuard::new(tc.roc_window_ms, tc.roc_threshold_bps, tc.roc_pause_ms);
+
         Self {
             state,
             fair_price_calc,
@@ -162,6 +166,7 @@ impl MarketBot {
             trade_flow,
             depth_imbalance,
             fast_cancel,
+            roc_guard,
             last_requote: Instant::now(),
             last_fast_cancel: None,
             last_binance_tick: None,
@@ -207,6 +212,7 @@ impl MarketBot {
                 *self.state.binance_mid.write() = Some(binance_mid);
                 self.fair_price_calc.update_reference_mid(binance_mid);
                 self.vol_estimator.on_trade(binance_mid);
+                self.roc_guard.on_price(binance_mid);
             }
             BotEvent::BinanceTrade { qty, is_buyer_maker, received_at, .. } => {
                 // VPIN from Binance trades — much faster signal than x10
@@ -691,6 +697,11 @@ impl MarketBot {
         self.is_requoting = true;
 
         if self.state.smoke_mode {
+            self.is_requoting = false;
+            return;
+        }
+        if self.roc_guard.is_paused() {
+            debug!("ROC guard active — skipping requote");
             self.is_requoting = false;
             return;
         }
@@ -1212,11 +1223,51 @@ impl MarketBot {
 
         info!(
             new_orders = order_reqs.len(),
-            extra_cancels = cancel_eids.len(),
+            cancels = cancel_eids.len(),
             "converge_orders: plan"
         );
 
-        // Send new orders in parallel (no cancel_id — plain new orders only)
+        // 1. Send cancels first and wait for completion.
+        //    If any cancel fails, abort — do NOT place new orders on top of live ones.
+        if !cancel_eids.is_empty() {
+            let cancel_futs: Vec<_> = cancel_eids.iter().map(|eid| {
+                let state = &self.state;
+                let exchange_id = eid.clone();
+                async move {
+                    match state.adapter.cancel_order(&exchange_id).await {
+                        Ok(ack) => {
+                            if ack.success {
+                                if let Some(ext_id) = state.order_tracker.resolve_exchange_id(&exchange_id) {
+                                    state.order_tracker.on_status_update(
+                                        &ext_id, OrderStatus::Cancelled, None, None, None, None,
+                                    );
+                                }
+                                true
+                            } else {
+                                warn!(exchange_id = %exchange_id, "converge: cancel failed (exchange rejected)");
+                                false
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, exchange_id = %exchange_id, "converge: cancel error");
+                            false
+                        }
+                    }
+                }
+            }).collect();
+            let cancel_results = futures_util::future::join_all(cancel_futs).await;
+            let cancel_failures = cancel_results.iter().filter(|&&ok| !ok).count();
+            if cancel_failures > 0 {
+                warn!(
+                    failures = cancel_failures,
+                    total = cancel_results.len(),
+                    "converge: some cancels failed — skipping new orders to avoid double orders"
+                );
+                return;
+            }
+        }
+
+        // 2. All cancels confirmed — now place new orders in parallel.
         if !order_reqs.is_empty() {
             let order_futs: Vec<_> = order_reqs.iter().map(|(req, _)| {
                 let state = &self.state;
@@ -1238,16 +1289,12 @@ impl MarketBot {
                                 );
                                 return false;
                             }
-                            // Don't mark old order Cancelled locally — let the WS
-                            // CANCELLED event from the exchange handle it. Marking it
-                            // here could race with a WS FILLED event and drop the fill.
                             true
                         }
                         Err(e) => {
                             let rtt = t0.elapsed().as_micros() as u64;
                             state.latency.record_order_rtt(rtt);
                             state.latency.record_tick_to_trade(tick_time.elapsed().as_micros() as u64);
-
                             error!(error = %e, id = %external_id, "converge: order creation failed");
                             state.circuit_breaker.record_error();
                             state.order_tracker.on_status_update(
@@ -1268,33 +1315,6 @@ impl MarketBot {
                 self.consecutive_rejects += 1;
                 warn!(rejects = reject_count, total = results.len(), consecutive = self.consecutive_rejects, "converge: partial or full order rejection");
             }
-        }
-
-        // Cancel extra orders individually (fire-and-forget)
-        if !cancel_eids.is_empty() {
-            let cancel_futs: Vec<_> = cancel_eids.iter().map(|eid| {
-                let state = &self.state;
-                let exchange_id = eid.clone();
-                async move {
-                    match state.adapter.cancel_order(&exchange_id).await {
-                        Ok(ack) => {
-                            if ack.success {
-                                if let Some(ext_id) = state.order_tracker.resolve_exchange_id(&exchange_id) {
-                                    state.order_tracker.on_status_update(
-                                        &ext_id, OrderStatus::Cancelled, None, None, None, None,
-                                    );
-                                }
-                            } else {
-                                warn!(exchange_id = %exchange_id, "converge: extra order cancel failed");
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, exchange_id = %exchange_id, "converge: extra order cancel error");
-                        }
-                    }
-                }
-            }).collect();
-            futures_util::future::join_all(cancel_futs).await;
         }
     }
 

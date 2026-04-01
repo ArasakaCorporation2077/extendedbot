@@ -210,7 +210,7 @@ impl OrderTracker {
         let mut ask_usd = Decimal::ZERO;
         for entry in self.by_external_id.iter() {
             let o: &TrackedOrder = entry.value();
-            if o.market == market && o.status.is_active() {
+            if o.market == market && o.status.is_active() && o.status != OrderStatus::PendingCancel {
                 let notional = o.remaining_qty * o.price;
                 match o.side {
                     Side::Buy => bid_usd += notional,
@@ -296,6 +296,21 @@ mod tests {
 
         let (bid, ask) = tracker.pending_exposure("BTC-USD", dec!(50000));
         assert_eq!(bid, dec!(50)); // 0.001 * 50000
+        assert_eq!(ask, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_pending_exposure_excludes_pending_cancel() {
+        let tracker = OrderTracker::new();
+        tracker.add_order(&test_order("ext-1"));
+
+        // Transition to Open first (required for PendingCancel transition)
+        tracker.on_status_update("ext-1", OrderStatus::Open, Some("exch-1".into()), None, None, None);
+        tracker.mark_pending_cancel("ext-1");
+
+        // PendingCancel orders must NOT count toward pending exposure
+        let (bid, ask) = tracker.pending_exposure("BTC-USD", dec!(50000));
+        assert_eq!(bid, Decimal::ZERO);
         assert_eq!(ask, Decimal::ZERO);
     }
 }
