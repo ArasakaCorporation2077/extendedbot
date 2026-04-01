@@ -662,14 +662,22 @@ impl MarketBot {
             Some(m) if !m.is_zero() => m,
             _ => return true, // No Binance data → allow quoting (safe fallback)
         };
+        // Basis-adjusted edge: subtract structural basis so that a persistent
+        // x10 discount/premium doesn't permanently block one side.
+        // basis_offset = EWMA(x10_mid - binance_mid), typically -8bps for ETH.
+        let basis_adj = self.fair_price_calc.basis_offset();
         let edge = match side {
             Side::Buy => {
-                // Edge to buy: how much cheaper our bid is vs Binance mid
-                ((bn_mid - quote_price) / bn_mid) * dec!(10000)
+                // Raw: how much cheaper our bid is vs Binance mid
+                // Adjusted: subtract basis (negative basis = x10 cheap → inflates buy edge)
+                let raw = ((bn_mid - quote_price) / bn_mid) * dec!(10000);
+                raw + (basis_adj / bn_mid) * dec!(10000) // basis_adj is negative → reduces edge
             }
             Side::Sell => {
-                // Edge to sell: how much more expensive our ask is vs Binance mid
-                ((quote_price - bn_mid) / bn_mid) * dec!(10000)
+                // Raw: how much more expensive our ask is vs Binance mid
+                // Adjusted: subtract basis (negative basis = x10 cheap → deflates sell edge)
+                let raw = ((quote_price - bn_mid) / bn_mid) * dec!(10000);
+                raw - (basis_adj / bn_mid) * dec!(10000) // basis_adj is negative → increases edge
             }
         };
         edge >= threshold
