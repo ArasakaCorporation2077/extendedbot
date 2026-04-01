@@ -1,11 +1,12 @@
-# Extended Market Maker — Project Status (2026-03-28)
+# Extended Market Maker — Project Status (2026-04-01)
 
 ## 현재 상태
-- **마켓**: TAO-USD (이전: BTC-USD, WIF-USD, CRCL_24_5-USD)
+- **마켓**: ETH-USD (이전: TAO-USD, BTC-USD, WIF-USD, CRCL_24_5-USD)
 - **EC2**: 54.199.221.223 (ap-northeast-1, t2.small)
 - **이전 EC2 IP**: 3.112.37.210 (변경됨)
-- **잔고**: ~$57 (시작 $104, 총 손실 ~$47)
-- **봇 상태**: 정지됨, 포지션 없음, 재시작 대기
+- **잔고**: ~$53 (시작 $104, 총 손실 ~$51)
+- **봇 상태**: 정지됨, 포지션 없음
+- **`--close`**: `./target/release/extended-mm --close`로 포지션 종료 가능
 - **SSH**: `ssh -i extendedMM.pem ec2-user@54.199.221.223`
 - **Bot path**: `~/extendedMM/target/release/extended-mm`
 - **Auto-restart**: `run.sh` (nohup wrapper, watchdog 3분)
@@ -405,10 +406,76 @@ TAO VPIN 상시 0.7+ → spread 3x 영구. 수정: threshold 0.85, bars 20.
 
 ---
 
+## 2026-03-31~04-01 세션 변경사항
+
+### 아키텍처 변경 (converge 패턴)
+- **cancel-all+place-all → converge** (gamma-ray 기반): 매번 전부 취소하는 대신 바뀐 주문만 교체
+- **cancel-replace 도입 후 제거**: x10 cancel_id가 WS CANCELLED 25초 지연 → ghost 원인. 개별 cancel + new order로 변경
+- **aggressive/reducing 분리** (beatzxbt 기반): edge 있을 때만 진입, reducing은 시간 따라 공격적
+- **이벤트 드리븐 requote**: 타이머 기반 → 가격 변화 기반
+- **basis-adjusted edge**: 구조적 basis(-8.5bps) 보정하여 양쪽 대칭 edge 계산
+
+### 버그 수정
+- BUG-1: PendingCancel 주문이 exposure 이중계산 → 필터 추가
+- BUG-2: cancel 전 신규 주문 제출 → cancel 먼저 실행, 확인 후 신규 주문
+- BUG-3: RocGuard 미연결 → 재연결 (30bps/10s → 15s pause)
+- Basis filter: quote_price 대신 x10_mid 사용, TAO 구조적 basis로 비활성화
+- VPIN tuning: bucket 5→50, threshold 0.85→0.92, bars 20→30
+- OrderResponse parse: camelCase rename + 누락 필드(cancelledQty 등)
+- Position sync: 빈 WS snapshot → position 0으로 리셋
+- Startup: mass_cancel 확인 루프 + REST position 최종 동기화
+- WS ORDER snapshot sync: 20초마다 ghost order 정리
+- Stale tracker 감지: >30초 ghost → 강제 정리
+- Unknown fill: REST position 재조회
+
+### 현재 Config
+```toml
+market = "ETH-USD"
+order_size_usd = 30.0
+max_position_usd = 80.0
+aggressive_edge_bps = 3.0      # basis-adjusted
+reducing_max_spread_bps = 4.0  # 시작 spread
+reducing_min_spread_bps = 2.0  # 최소 spread (decay 후)
+reducing_decay_s = 30.0
+update_threshold_bps = 3.0
+min_requote_interval_ms = 100  # 디바운스만
+max_order_age_s = 300.0        # 사실상 비활성화
+fast_cancel_threshold_bps = 3.0
+roc_window_ms = 10000
+roc_threshold_bps = 30.0
+roc_pause_ms = 15000
+```
+
+### Markout 데이터 (ETH-USD, 3bps edge)
+```
+Horizon    Raw      Adj
+50ms      -0.38    -0.32
+200ms     -0.71    -0.56
+500ms     -0.94    -0.55
+1000ms    -1.29    -0.78
+5000ms    -1.05    -1.47
+```
+- 전반적으로 마이너스 (역선택)
+- adj가 raw보다 나음 (바이낸스 보정 효과)
+- sell이 buy보다 나쁨 (reducing sell이 trending 시 손해)
+
+### 미해결 문제
+1. **Markout 음수**: 파라미터 튜닝 필요 (reducing spread, margin, fast cancel)
+2. **Position manager 오염**: auto-flatten 후 리셋은 고쳤지만 런타임 중 WS snapshot 누락 시 불일치 가능
+3. **REST reconcile 간헐적 실패**: WS snapshot sync로 보완했지만 완전하지 않음
+
+### 읽은 글 추가
+- Nanex 리서치: quote stuffing, fantaseconds, HFT manipulation, momentum ignition
+- beatzxbt 블로그: aggressive/reducing 분리, micro alt MM 전략
+- gamma-ray (hello2all): converge 패턴, quotes_are_same gate, AS 구현
+- hummingbot: hanging orders, order_refresh_tolerance, filled_order_delay
+- Crypto Chassis: 방어적 MM, ROC guard, skew sniffer
+
 ## TODO
-- [ ] TAO-USD fill 200개 모아서 markout 분석
-- [ ] regression 재실행 (flow/depth 포함)
-- [ ] 포인트 파머 패턴 감지
-- [ ] funding rate 캐리 전략 결합
-- [ ] Reya 거래소 프로토타입
-- [ ] 멀티마켓 동시 운영 (config만 바꿔서)
+- [ ] markout 양수 전환: reducing spread/margin/fast cancel 튜닝
+- [ ] BUG-4: WsConnected 후 position 재동기화
+- [ ] BUG-5~7: VPIN threshold 조정, markout→호가 차단 연동
+- [ ] 미시 모멘텀 필터: 바이낸스 1초 내 2bps 이상 움직이면 해당 방향 호가 철수
+- [ ] markout feedback → aggressive edge threshold 동적 조절
+- [ ] 멀티마켓 동시 운영
+- [ ] /plan-eng-review (gstack) 실행
