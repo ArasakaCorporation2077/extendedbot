@@ -71,7 +71,7 @@ hard_one_side_inventory_ratio = 0.70
 # Aggressive/reducing quoting (beatzxbt pattern)
 # aggressive_edge_bps: minimum edge vs Binance to open new inventory
 # reducing_*: spread decay for the inventory-closing side
-aggressive_edge_bps = 4.0
+aggressive_edge_bps = 2.0
 reducing_max_spread_bps = 4.0
 reducing_min_spread_bps = 1.0
 reducing_decay_s = 30.0
