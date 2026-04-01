@@ -686,6 +686,16 @@ impl MarketBot {
                 raw - (basis_adj / bn_mid) * dec!(10000) // basis_adj is negative → increases edge
             }
         };
+        debug!(
+            side = %side,
+            quote_price = %quote_price,
+            bn_mid = %bn_mid,
+            basis_adj = %basis_adj,
+            edge = %edge,
+            threshold = %threshold,
+            pass = edge >= threshold,
+            "aggressive edge check"
+        );
         edge >= threshold
     }
 
