@@ -1,0 +1,90 @@
+# Extended Exchange Market Maker - Altcoin Config
+# For low-liquidity markets ($200K-$2M daily volume)
+# Fills expected every 10-30 minutes, spreads 6-15bps
+#
+# Usage: EXTENDED_CONFIG=config/altcoin.toml cargo run -p extended-bot
+
+[exchange]
+paper_trading = false
+user_agent = "extended-mm/0.1.0"
+# API key and secret from env: EXTENDED_API_KEY, EXTENDED_API_SECRET
+
+[trading]
+market = "MON-USD"            # Override per market
+order_size_usd = 30.0
+min_order_usd = 25.0
+max_order_usd = 40.0
+leverage = 5
+
+expiry_days = 7
+dead_man_switch_timeout_ms = 60000
+
+# Fair price — slower reaction for sparse orderbooks
+ewma_alpha = 0.005            # Slower basis tracking (half of ETH)
+update_threshold_bps = 5.0    # Only requote on 5bps+ moves (vs 3bps)
+min_requote_interval_ms = 1000 # 1s debounce (vs 100ms) — orderbook moves slowly
+
+# Spread — wider to capture more per fill
+base_spread_bps = 6.0         # 6bps base (vs 4bps)
+min_spread_bps = 4.0          # Never tighter than 4bps (vs 2bps)
+max_spread_bps = 30.0         # Allow wider in volatile periods
+volatility_sensitivity = 0.3  # Less vol reaction (fewer data points)
+latency_vol_multiplier = 2.0
+markout_sensitivity = 0.3     # Less markout feedback (fewer fills to learn from)
+
+# Skew — gentler, positions held longer
+price_skew_enabled = true
+price_skew_bps = 5.0          # Gentler skew (vs 7bps) — don't push too hard
+size_skew_enabled = true
+size_skew_factor = 0.8
+min_size_multiplier = 0.3
+max_size_multiplier = 1.5
+emergency_flatten_ratio = 0.8
+
+# VPIN — smaller buckets for lower volume
+vpin_bucket_volume = 5.0      # Much smaller for altcoin volume
+vpin_num_buckets = 50
+
+# Multi-level — single level to concentrate liquidity
+num_levels = 1
+level_spacing_bps = 5.0
+level_size_decay = 0.7
+
+# Fast cancel — much less aggressive
+fast_cancel_threshold_bps = 8.0  # Only cancel on 8bps+ adverse move (vs 3bps)
+max_order_age_s = 300.0          # Let orders sit for 5 minutes
+
+# Best price tighten — wider margin in thin books
+best_price_tighten_enabled = true
+best_price_margin_bps = 2.0     # 2bps behind BBO (vs 1bps)
+
+# Close mode
+close_threshold_ratio = 0.25
+close_spread_bps = 6.0
+
+# Trade flow / depth imbalance — lower sensitivity (less signal in thin markets)
+trade_flow_sensitivity_bps = 0.3
+depth_imbalance_sensitivity_bps = 0.2
+
+# Inventory — same thresholds but wider position allowed
+one_side_inventory_ratio = 0.45
+hard_one_side_inventory_ratio = 0.70
+
+# Aggressive/reducing — key differences for sparse fills
+aggressive_edge_bps = 5.0       # Higher bar to open (vs 3bps) — be selective
+reducing_max_spread_bps = 8.0   # Start wide when exiting (vs 4bps)
+reducing_min_spread_bps = 3.0   # Min reducing spread (vs 1bps)
+reducing_decay_s = 300.0        # 5 minute decay (vs 30s) — fills are rare
+
+# ROC guard — wider threshold for volatile alts
+roc_window_ms = 10000
+roc_threshold_bps = 50.0        # 50bps threshold (vs 30bps)
+roc_pause_ms = 20000
+
+[risk]
+max_position_usd = 50.0         # Smaller max position
+max_daily_loss_usd = 100.0      # Tighter loss limit ($53 balance)
+max_orders_per_minute = 100     # Fewer orders needed
+max_errors_per_minute = 10
+stale_price_s = 10.0            # Wider stale window (thin book updates less)
+cooldown_s = 120                # Longer cooldown after circuit break

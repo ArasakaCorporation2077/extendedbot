@@ -24,6 +24,10 @@ struct Cli {
     /// Close all positions and exit
     #[arg(long)]
     close: bool,
+
+    /// Config file path (default: config/default)
+    #[arg(long, short, default_value = "config/default")]
+    config: String,
 }
 
 #[tokio::main]
@@ -50,7 +54,7 @@ async fn main() -> Result<()> {
     );
 
     // Load config
-    let mut app_config = load_config()?;
+    let mut app_config = load_config(&cli.config)?;
 
     // Override from env
     if let Ok(key) = std::env::var("EXTENDED_API_KEY") {
@@ -102,9 +106,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn load_config() -> Result<extended_types::config::AppConfig> {
+fn load_config(config_path: &str) -> Result<extended_types::config::AppConfig> {
+    info!(config = %config_path, "Loading config");
     let settings = config::Config::builder()
-        .add_source(config::File::with_name("config/default").required(true))
+        .add_source(config::File::with_name(config_path).required(true))
         .add_source(config::Environment::with_prefix("EXTENDED").separator("__"))
         .build()?;
 

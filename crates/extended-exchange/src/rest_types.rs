@@ -247,22 +247,74 @@ where D: serde::Deserializer<'de>,
 }
 
 /// Market stats from GET /api/v1/info/markets/{market}/stats.
+/// Actual API returns: dailyVolume, dailyVolumeBase, dailyPriceChange,
+/// dailyPriceChangePercentage, dailyLow, dailyHigh, lastPrice,
+/// markPrice, indexPrice, fundingRate, openInterest (all as strings).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketStatsResponse {
-    pub market: String,
-    pub mark_price: Option<Decimal>,
-    pub index_price: Option<Decimal>,
-    pub funding_rate: Option<Decimal>,
-    pub volume_24h: Option<Decimal>,
-    pub open_interest: Option<Decimal>,
+    #[serde(default)]
+    pub daily_volume: Option<String>,
+    #[serde(default)]
+    pub daily_volume_base: Option<String>,
+    #[serde(default)]
+    pub daily_price_change: Option<String>,
+    #[serde(default)]
+    pub daily_price_change_percentage: Option<String>,
+    #[serde(default)]
+    pub daily_low: Option<String>,
+    #[serde(default)]
+    pub daily_high: Option<String>,
+    #[serde(default)]
+    pub last_price: Option<String>,
+    #[serde(default)]
+    pub mark_price: Option<String>,
+    #[serde(default)]
+    pub index_price: Option<String>,
+    #[serde(default)]
+    pub funding_rate: Option<String>,
+    #[serde(default)]
+    pub open_interest: Option<String>,
+}
+
+impl MarketStatsResponse {
+    pub fn volume_usd(&self) -> Option<Decimal> {
+        self.daily_volume.as_ref()?.parse().ok()
+    }
+
+    pub fn mark_price_decimal(&self) -> Option<Decimal> {
+        self.mark_price.as_ref()?.parse().ok()
+    }
+
+    pub fn funding_rate_decimal(&self) -> Option<Decimal> {
+        self.funding_rate.as_ref()?.parse().ok()
+    }
+
+    pub fn open_interest_decimal(&self) -> Option<Decimal> {
+        self.open_interest.as_ref()?.parse().ok()
+    }
+}
+
+/// Orderbook level from GET /api/v1/info/markets/{market}/orderbook.
+/// Actual API returns: {"price":"0.10765","qty":"13890"}
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrderbookLevel {
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub price: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub qty: Decimal,
 }
 
 /// Orderbook from GET /api/v1/info/markets/{market}/orderbook.
+/// Actual API returns: {"market":"...","bid":[...],"ask":[...]}
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrderbookResponse {
-    pub bids: Vec<[Decimal; 2]>,
-    pub asks: Vec<[Decimal; 2]>,
+    #[serde(default)]
+    pub market: Option<String>,
+    #[serde(default)]
+    pub bid: Vec<OrderbookLevel>,
+    #[serde(default)]
+    pub ask: Vec<OrderbookLevel>,
 }
 
 /// Order creation response from POST /api/v1/user/order.
