@@ -7,6 +7,10 @@ edition = "2021"
 name = "extended-mm"
 path = "src/main.rs"
 
+[[bin]]
+name = "observer"
+path = "src/bin/observer.rs"
+
 [dependencies]
 extended-types = { workspace = true }
 extended-crypto = { workspace = true }
@@ -15,6 +19,7 @@ extended-orderbook = { workspace = true }
 extended-risk = { workspace = true }
 extended-strategy = { workspace = true }
 extended-paper = { workspace = true }
+reqwest = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }

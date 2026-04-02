@@ -725,6 +725,7 @@ dependencies = [
  "extended-types",
  "futures-util",
  "parking_lot",
+ "reqwest",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
