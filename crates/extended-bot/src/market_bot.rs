@@ -665,9 +665,13 @@ impl MarketBot {
         let base_threshold = Decimal::try_from(
             self.state.config.trading.aggressive_edge_bps
         ).unwrap_or(dec!(2.0));
-        // Dynamic edge: base + markout toxicity feedback.
+        // Dynamic edge: base + scaled markout toxicity feedback.
         // Bad markout → higher threshold → fewer entries.
-        let markout_feedback = self.state.markout.feedback_bps(self.state.market());
+        // Sensitivity 0.3 = 30% of tox_score feeds into edge threshold.
+        let markout_sensitivity = Decimal::try_from(
+            self.state.config.trading.markout_sensitivity
+        ).unwrap_or(dec!(0.3));
+        let markout_feedback = self.state.markout.feedback_bps(self.state.market()) * markout_sensitivity;
         let threshold = base_threshold + markout_feedback;
         let bn_mid = match *self.state.binance_mid.read() {
             Some(m) if !m.is_zero() => m,
