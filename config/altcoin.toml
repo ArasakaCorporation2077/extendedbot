@@ -20,9 +20,9 @@ expiry_days = 7
 dead_man_switch_timeout_ms = 60000
 
 # Fair price — slower reaction for sparse orderbooks
-ewma_alpha = 0.005            # Slower basis tracking (half of ETH)
-update_threshold_bps = 5.0    # Only requote on 5bps+ moves (vs 3bps)
-min_requote_interval_ms = 1000 # 1s debounce (vs 100ms) — orderbook moves slowly
+ewma_alpha = 0.01             # Same as ETH — fast basis tracking
+update_threshold_bps = 3.0    # React to 3bps moves — stale quotes = adverse selection
+min_requote_interval_ms = 200  # 200ms debounce — fast enough to avoid staleness
 
 # Spread — wider to capture more per fill
 base_spread_bps = 12.0        # 12bps base — covers -4.66bps markout per side
@@ -52,8 +52,8 @@ level_spacing_bps = 5.0
 level_size_decay = 0.7
 
 # Fast cancel — much less aggressive
-fast_cancel_threshold_bps = 8.0  # Only cancel on 8bps+ adverse move (vs 3bps)
-max_order_age_s = 120.0          # 2min max — stale orders get worst markout
+fast_cancel_threshold_bps = 4.0  # Cancel on 4bps adverse — don't be a sitting duck
+max_order_age_s = 60.0           # 1min max — stale orders = worst markout
 
 # Best price tighten — wider margin in thin books
 best_price_tighten_enabled = true
