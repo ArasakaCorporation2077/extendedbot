@@ -25,8 +25,8 @@ update_threshold_bps = 3.0    # React to 3bps moves — stale quotes = adverse s
 min_requote_interval_ms = 200  # 200ms debounce — fast enough to avoid staleness
 
 # Spread — wider to capture more per fill
-base_spread_bps = 12.0        # 12bps base — covers -4.66bps markout per side
-min_spread_bps = 6.0          # Never tighter than 6bps
+base_spread_bps = 16.0        # 16bps base — each side captures 8bps, covers -5bps markout
+min_spread_bps = 8.0          # Never tighter than 8bps
 max_spread_bps = 30.0         # Allow wider in volatile periods
 volatility_sensitivity = 0.3  # Less vol reaction (fewer data points)
 latency_vol_multiplier = 2.0
@@ -34,7 +34,7 @@ markout_sensitivity = 0.3     # Less markout feedback (fewer fills to learn from
 
 # Skew — gentler, positions held longer
 price_skew_enabled = true
-price_skew_bps = 10.0         # Stronger skew — pull sell quotes faster in uptrend
+price_skew_bps = 15.0         # Very strong skew — pull adverse side hard in trends
 size_skew_enabled = true
 size_skew_factor = 0.8
 min_size_multiplier = 0.3
@@ -52,8 +52,8 @@ level_spacing_bps = 5.0
 level_size_decay = 0.7
 
 # Fast cancel — much less aggressive
-fast_cancel_threshold_bps = 4.0  # Cancel on 4bps adverse — don't be a sitting duck
-max_order_age_s = 60.0           # 1min max — stale orders = worst markout
+fast_cancel_threshold_bps = 2.0  # Cancel on 2bps adverse — fastest possible reaction
+max_order_age_s = 30.0           # 30s max — stale orders have worst markout
 
 # Best price tighten — wider margin in thin books
 best_price_tighten_enabled = true
@@ -79,7 +79,7 @@ reducing_decay_s = 300.0        # 5 minute decay (vs 30s) — fills are rare
 
 # ROC guard — wider threshold for volatile alts
 roc_window_ms = 10000
-roc_threshold_bps = 50.0        # 50bps threshold (vs 30bps)
+roc_threshold_bps = 20.0        # 20bps — pause quoting on strong trends early
 roc_pause_ms = 20000
 
 [risk]
