@@ -25,8 +25,8 @@ update_threshold_bps = 5.0    # Only requote on 5bps+ moves (vs 3bps)
 min_requote_interval_ms = 1000 # 1s debounce (vs 100ms) — orderbook moves slowly
 
 # Spread — wider to capture more per fill
-base_spread_bps = 6.0         # 6bps base (vs 4bps)
-min_spread_bps = 4.0          # Never tighter than 4bps (vs 2bps)
+base_spread_bps = 12.0        # 12bps base — covers -4.66bps markout per side
+min_spread_bps = 6.0          # Never tighter than 6bps
 max_spread_bps = 30.0         # Allow wider in volatile periods
 volatility_sensitivity = 0.3  # Less vol reaction (fewer data points)
 latency_vol_multiplier = 2.0
@@ -34,7 +34,7 @@ markout_sensitivity = 0.3     # Less markout feedback (fewer fills to learn from
 
 # Skew — gentler, positions held longer
 price_skew_enabled = true
-price_skew_bps = 5.0          # Gentler skew (vs 7bps) — don't push too hard
+price_skew_bps = 10.0         # Stronger skew — pull sell quotes faster in uptrend
 size_skew_enabled = true
 size_skew_factor = 0.8
 min_size_multiplier = 0.3
@@ -53,7 +53,7 @@ level_size_decay = 0.7
 
 # Fast cancel — much less aggressive
 fast_cancel_threshold_bps = 8.0  # Only cancel on 8bps+ adverse move (vs 3bps)
-max_order_age_s = 300.0          # Let orders sit for 5 minutes
+max_order_age_s = 120.0          # 2min max — stale orders get worst markout
 
 # Best price tighten — wider margin in thin books
 best_price_tighten_enabled = true
@@ -72,7 +72,7 @@ one_side_inventory_ratio = 0.45
 hard_one_side_inventory_ratio = 0.70
 
 # Aggressive/reducing — key differences for sparse fills
-aggressive_edge_bps = 50.0      # Effectively disable aggressive entry — reducing-only mode
+aggressive_edge_bps = 5.0       # Edge filter restored — only enter when 5bps+ edge vs Binance
 reducing_max_spread_bps = 8.0   # Start wide when exiting (vs 4bps)
 reducing_min_spread_bps = 3.0   # Min reducing spread (vs 1bps)
 reducing_decay_s = 300.0        # 5 minute decay (vs 30s) — fills are rare
