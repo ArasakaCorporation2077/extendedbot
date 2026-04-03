@@ -214,7 +214,9 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
                         };
                         let mark = p.mark_price.unwrap_or(p.entry_price);
                         let slippage = if signed > Decimal::ZERO { dec!(0.995) } else { dec!(1.005) };
-                        let close_price = (mark * slippage).round_dp(8);
+                        let dp = tick_size.to_string()
+                            .find('.').map(|d| tick_size.to_string().len() - d - 1).unwrap_or(0) as u32;
+                        let close_price = (mark * slippage).round_dp(dp);
                         info!(market = %p.market, side = side_str, qty = %p.size, price = %close_price, "Startup flatten: closing position");
                         let close_req = extended_types::order::OrderRequest {
                             external_id: format!("emm-close-startup-{}", uuid::Uuid::new_v4().simple()),
@@ -675,7 +677,12 @@ pub async fn close_all(config: AppConfig) -> Result<()> {
 
     // 2. Cache market config for signing
     let market = &config.trading.market;
-    bootstrap_market_config(&rest, market).await;
+    let (tick_size, _size_step) = bootstrap_market_config(&rest, market).await;
+    // Derive decimal places from tick size (e.g. 0.00001 → 5dp)
+    let price_dp = tick_size.to_string()
+        .find('.')
+        .map(|dot| tick_size.to_string().len() - dot - 1)
+        .unwrap_or(0) as u32;
 
     // 3. Mass cancel all open orders
     info!("Mass cancelling all orders...");
@@ -712,10 +719,10 @@ pub async fn close_all(config: AppConfig) -> Result<()> {
                 let slippage = raw_price * dec!(0.005);
                 let close_price = if signed_size > Decimal::ZERO {
                     // Long → sell: mark - 0.5%
-                    (raw_price - slippage).round_dp(8)
+                    (raw_price - slippage).round_dp(price_dp)
                 } else {
                     // Short → buy: mark + 0.5%
-                    (raw_price + slippage).round_dp(8)
+                    (raw_price + slippage).round_dp(price_dp)
                 };
 
                 info!(
