@@ -728,14 +728,19 @@ impl MarketBot {
         let inventory_ratio = self.state.position_manager.inventory_ratio(&market);
 
         // Calculate spread — uses sustained toxic detection (8+ consecutive elevated bars)
-        let vpin_mult = self.vpin_calc.spread_multiplier();
-        if self.vpin_calc.is_sustained_toxic() {
-            warn!(
-                vpin = %self.vpin_calc.vpin(),
-                consecutive = self.vpin_calc.consecutive_elevated_count(),
-                "Sustained toxic flow detected — spread 3x"
-            );
-        }
+        let vpin_mult = if self.state.config.trading.vpin_enabled {
+            let m = self.vpin_calc.spread_multiplier();
+            if self.vpin_calc.is_sustained_toxic() {
+                warn!(
+                    vpin = %self.vpin_calc.vpin(),
+                    consecutive = self.vpin_calc.consecutive_elevated_count(),
+                    "Sustained toxic flow detected — spread 3x"
+                );
+            }
+            m
+        } else {
+            Decimal::ONE // VPIN disabled — no spread multiplier
+        };
 
         // Rolling realized volatility from recent trade prices (bps).
         let volatility_bps = self.vol_estimator.volatility_bps();

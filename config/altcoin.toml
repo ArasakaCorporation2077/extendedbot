@@ -41,8 +41,9 @@ min_size_multiplier = 0.3
 max_size_multiplier = 1.5
 emergency_flatten_ratio = 0.8
 
-# VPIN — smaller buckets for lower volume
-vpin_bucket_volume = 5.0      # Much smaller for altcoin volume
+# VPIN — disabled for low-liquidity alts (insufficient trade data → always reads 1.0)
+vpin_enabled = false
+vpin_bucket_volume = 5.0
 vpin_num_buckets = 50
 
 # Multi-level — single level to concentrate liquidity
