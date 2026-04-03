@@ -662,8 +662,13 @@ impl MarketBot {
     /// Returns true if there is sufficient edge on `side` vs Binance mid to justify
     /// quoting the inventory-opening (aggressive) side.
     fn has_aggressive_edge(&self, side: Side, quote_price: Decimal) -> bool {
-        let threshold_f = self.state.config.trading.aggressive_edge_bps;
-        let threshold = Decimal::try_from(threshold_f).unwrap_or(dec!(2.0));
+        let base_threshold = Decimal::try_from(
+            self.state.config.trading.aggressive_edge_bps
+        ).unwrap_or(dec!(2.0));
+        // Dynamic edge: base + markout toxicity feedback.
+        // Bad markout → higher threshold → fewer entries.
+        let markout_feedback = self.state.markout.feedback_bps(self.state.market());
+        let threshold = base_threshold + markout_feedback;
         let bn_mid = match *self.state.binance_mid.read() {
             Some(m) if !m.is_zero() => m,
             _ => return true, // No Binance data → allow quoting (safe fallback)
@@ -693,8 +698,10 @@ impl MarketBot {
             basis_adj = %basis_adj,
             edge = %edge,
             threshold = %threshold,
+            base_threshold = %base_threshold,
+            markout_feedback = %markout_feedback,
             pass = edge >= threshold,
-            "aggressive edge check"
+            "aggressive edge check (dynamic)"
         );
         edge >= threshold
     }
