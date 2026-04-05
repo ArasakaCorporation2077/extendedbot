@@ -202,7 +202,7 @@ impl MarketBot {
                     *self.state.index_price.write() = Some(price);
                 }
             }
-            BotEvent::BinanceBbo { bid, ask, received_at } => {
+            BotEvent::BinanceBbo { bid, bid_size, ask, ask_size, received_at } => {
                 let queue_delay_us = received_at.elapsed().as_micros();
                 if queue_delay_us > 5000 {
                     debug!(queue_delay_us, "Binance BBO event queue delay >5ms");
@@ -210,7 +210,8 @@ impl MarketBot {
                 self.last_binance_tick = Some(received_at);
                 let binance_mid = (bid + ask) / dec!(2);
                 *self.state.binance_mid.write() = Some(binance_mid);
-                self.fair_price_calc.update_reference_mid(binance_mid);
+                // Use microprice (depth-weighted mid) for better fair value
+                self.fair_price_calc.update_reference_microprice(bid, bid_size, ask, ask_size);
                 self.vol_estimator.on_trade(binance_mid);
                 self.roc_guard.on_price(binance_mid);
             }
@@ -891,8 +892,13 @@ impl MarketBot {
             // Ask = reducing (always quote, spread decays)
             let q_ask = gen_quotes_for_side(&self.quote_gen, &reducing_spread, ActiveSide::AskOnly);
 
-            // Bid = aggressive (only if edge exists)
-            let bid_quotes = if self.has_aggressive_edge(Side::Buy, normal_bid_price) {
+            // Bid = aggressive (only if edge exists AND flow not adverse)
+            let flow = self.trade_flow.imbalance();
+            let bid_quotes = if flow < -dec!(0.6) {
+                // Strong sell flow on Binance → don't add to long
+                debug!(flow = %flow, "Long bid suppressed — adverse sell flow");
+                vec![]
+            } else if self.has_aggressive_edge(Side::Buy, normal_bid_price) {
                 let q = gen_quotes_for_side(&self.quote_gen, &spread, ActiveSide::BidOnly);
                 q.bids
             } else {
@@ -904,8 +910,13 @@ impl MarketBot {
             // Bid = reducing (always quote, spread decays)
             let q_bid = gen_quotes_for_side(&self.quote_gen, &reducing_spread, ActiveSide::BidOnly);
 
-            // Ask = aggressive (only if edge exists)
-            let ask_quotes = if self.has_aggressive_edge(Side::Sell, normal_ask_price) {
+            // Ask = aggressive (only if edge exists AND flow not adverse)
+            let flow = self.trade_flow.imbalance();
+            let ask_quotes = if flow > dec!(0.6) {
+                // Strong buy flow on Binance → don't add to short
+                debug!(flow = %flow, "Short ask suppressed — adverse buy flow");
+                vec![]
+            } else if self.has_aggressive_edge(Side::Sell, normal_ask_price) {
                 let q = gen_quotes_for_side(&self.quote_gen, &spread, ActiveSide::AskOnly);
                 q.asks
             } else {
@@ -931,6 +942,20 @@ impl MarketBot {
                         info!(basis_deviation = %basis_deviation, "Basis filter (flat) → no bid (sudden discount)");
                     }
                 }
+            }
+
+            // Trade flow gating: pull adverse side when Binance flow is directional.
+            // Strong buy flow → don't sell (we'd be adversely selected).
+            // Strong sell flow → don't buy.
+            let flow = self.trade_flow.imbalance();
+            let flow_gate_threshold = dec!(0.6);
+            if flow > flow_gate_threshold && ask_active {
+                ask_active = false;
+                info!(flow = %flow, "Flow gating → no ask (strong buy flow on Binance)");
+            }
+            if flow < -flow_gate_threshold && bid_active {
+                bid_active = false;
+                info!(flow = %flow, "Flow gating → no bid (strong sell flow on Binance)");
             }
 
             // Edge filter: only quote each side if we have edge vs Binance.

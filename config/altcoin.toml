@@ -41,9 +41,11 @@ min_size_multiplier = 0.3
 max_size_multiplier = 1.5
 emergency_flatten_ratio = 0.8
 
-# VPIN — disabled for low-liquidity alts (insufficient trade data → always reads 1.0)
-vpin_enabled = false
-vpin_bucket_volume = 5.0
+# VPIN — re-enabled with larger buckets for altcoin volume
+# MON Binance ~$500K daily / $0.025 = ~20M MON / 50 buckets = 400K per bucket
+# Using 500.0 (more responsive than 400K, but not as noisy as 5.0)
+vpin_enabled = true
+vpin_bucket_volume = 500.0
 vpin_num_buckets = 50
 
 # Multi-level — single level to concentrate liquidity

@@ -55,7 +55,7 @@ impl FairPriceCalculator {
         self.recalculate()
     }
 
-    /// Update with Binance reference mid.
+    /// Update with Binance reference mid (simple midprice).
     pub fn update_reference_mid(&mut self, mid: Decimal) -> Option<Decimal> {
         self.last_binance_mid = Some(mid);
         // basis_offset = x10_mid - binance_mid
@@ -67,6 +67,24 @@ impl FairPriceCalculator {
             });
         }
         self.recalculate()
+    }
+
+    /// Update with Binance microprice (depth-weighted mid).
+    /// microprice = (ask_price * bid_size + bid_price * ask_size) / (bid_size + ask_size)
+    /// More accurate than simple mid when orderbook is imbalanced.
+    pub fn update_reference_microprice(
+        &mut self,
+        bid_price: Decimal,
+        bid_size: Decimal,
+        ask_price: Decimal,
+        ask_size: Decimal,
+    ) -> Option<Decimal> {
+        let total = bid_size + ask_size;
+        if total.is_zero() {
+            return self.fair_price;
+        }
+        let microprice = (ask_price * bid_size + bid_price * ask_size) / total;
+        self.update_reference_mid(microprice)
     }
 
     fn recalculate(&mut self) -> Option<Decimal> {
