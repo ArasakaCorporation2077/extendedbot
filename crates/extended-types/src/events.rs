@@ -69,7 +69,9 @@ pub enum BotEvent {
     // -- External reference data --
     BinanceBbo {
         bid: Decimal,
+        bid_size: Decimal,
         ask: Decimal,
+        ask_size: Decimal,
         received_at: Instant,
     },
     BinanceTrade {

@@ -100,6 +100,8 @@ pub struct TradingConfig {
     pub emergency_flatten_ratio: f64,
 
     // VPIN
+    #[serde(default = "default_true")]
+    pub vpin_enabled: bool,
     #[serde(default = "default_vpin_bucket")]
     pub vpin_bucket_volume: f64,
     #[serde(default = "default_vpin_buckets")]

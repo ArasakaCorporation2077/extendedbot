@@ -22,8 +22,12 @@ struct RawBookTicker {
     _symbol: String,
     #[serde(rename = "b")]
     bid_price: String,
+    #[serde(rename = "B")]
+    bid_qty: String,
     #[serde(rename = "a")]
     ask_price: String,
+    #[serde(rename = "A")]
+    ask_qty: String,
 }
 
 #[derive(Deserialize)]
@@ -144,13 +148,17 @@ impl BinanceWs {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
+                            let bid_size: Decimal = ticker.bid_qty.parse().unwrap_or(Decimal::ZERO);
                             let ask: Decimal = match ticker.ask_price.parse() {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
+                            let ask_size: Decimal = ticker.ask_qty.parse().unwrap_or(Decimal::ZERO);
                             let _ = event_tx.send(BotEvent::BinanceBbo {
                                 bid,
+                                bid_size,
                                 ask,
+                                ask_size,
                                 received_at: Instant::now(),
                             });
                         }
