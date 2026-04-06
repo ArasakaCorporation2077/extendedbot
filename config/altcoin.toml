@@ -41,11 +41,12 @@ min_size_multiplier = 0.3
 max_size_multiplier = 1.5
 emergency_flatten_ratio = 0.8
 
-# VPIN — re-enabled with larger buckets for altcoin volume
-# MON Binance ~$500K daily / $0.025 = ~20M MON / 50 buckets = 400K per bucket
-# Using 500.0 (more responsive than 400K, but not as noisy as 5.0)
+# VPIN — re-enabled with buckets sized for altcoin volume
+# MON Binance ~$500K daily / $0.025 = ~20M MON daily
+# 10K per bucket → ~2000 buckets/day → each bucket ≈ 43s of trading
+# 50-bucket window ≈ 36 minutes of sustained flow data
 vpin_enabled = true
-vpin_bucket_volume = 500.0
+vpin_bucket_volume = 10000.0
 vpin_num_buckets = 50
 
 # Multi-level — single level to concentrate liquidity
@@ -54,7 +55,7 @@ level_spacing_bps = 5.0
 level_size_decay = 0.7
 
 # Fast cancel — much less aggressive
-fast_cancel_threshold_bps = 2.0  # Cancel on 2bps adverse — fastest possible reaction
+fast_cancel_threshold_bps = 4.0  # Cancel on 4bps adverse (must be > update_threshold to avoid cancel-without-replace)
 max_order_age_s = 30.0           # 30s max — stale orders have worst markout
 
 # Best price tighten — wider margin in thin books

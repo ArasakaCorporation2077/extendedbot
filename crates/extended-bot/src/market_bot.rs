@@ -208,10 +208,15 @@ impl MarketBot {
                     debug!(queue_delay_us, "Binance BBO event queue delay >5ms");
                 }
                 self.last_binance_tick = Some(received_at);
-                let binance_mid = (bid + ask) / dec!(2);
+                // Compute microprice once, use everywhere for consistency
+                let total_size = bid_size + ask_size;
+                let binance_mid = if total_size.is_zero() {
+                    (bid + ask) / dec!(2) // fallback to simple mid
+                } else {
+                    (ask * bid_size + bid * ask_size) / total_size
+                };
                 *self.state.binance_mid.write() = Some(binance_mid);
-                // Use microprice (depth-weighted mid) for better fair value
-                self.fair_price_calc.update_reference_microprice(bid, bid_size, ask, ask_size);
+                self.fair_price_calc.update_reference_mid(binance_mid);
                 self.vol_estimator.on_trade(binance_mid);
                 self.roc_guard.on_price(binance_mid);
             }
@@ -673,7 +678,8 @@ impl MarketBot {
             self.state.config.trading.markout_sensitivity
         ).unwrap_or(dec!(0.3));
         let markout_feedback = self.state.markout.feedback_bps(self.state.market()) * markout_sensitivity;
-        let threshold = base_threshold + markout_feedback;
+        // Cap at 3x base to prevent permanent lock-out when no fills arrive to reset EWMA
+        let threshold = (base_threshold + markout_feedback).min(base_threshold * dec!(3));
         let bn_mid = match *self.state.binance_mid.read() {
             Some(m) if !m.is_zero() => m,
             _ => return true, // No Binance data → allow quoting (safe fallback)
@@ -893,8 +899,10 @@ impl MarketBot {
             let q_ask = gen_quotes_for_side(&self.quote_gen, &reducing_spread, ActiveSide::AskOnly);
 
             // Bid = aggressive (only if edge exists AND flow not adverse)
+            // Require 3+ trades in window to avoid single-trade noise triggering gate
             let flow = self.trade_flow.imbalance();
-            let bid_quotes = if flow < -dec!(0.6) {
+            let flow_reliable = self.trade_flow.trade_count() >= 3;
+            let bid_quotes = if flow_reliable && flow < -dec!(0.6) {
                 // Strong sell flow on Binance → don't add to long
                 debug!(flow = %flow, "Long bid suppressed — adverse sell flow");
                 vec![]
@@ -912,7 +920,8 @@ impl MarketBot {
 
             // Ask = aggressive (only if edge exists AND flow not adverse)
             let flow = self.trade_flow.imbalance();
-            let ask_quotes = if flow > dec!(0.6) {
+            let flow_reliable = self.trade_flow.trade_count() >= 3;
+            let ask_quotes = if flow_reliable && flow > dec!(0.6) {
                 // Strong buy flow on Binance → don't add to short
                 debug!(flow = %flow, "Short ask suppressed — adverse buy flow");
                 vec![]
@@ -947,13 +956,15 @@ impl MarketBot {
             // Trade flow gating: pull adverse side when Binance flow is directional.
             // Strong buy flow → don't sell (we'd be adversely selected).
             // Strong sell flow → don't buy.
+            // Require 3+ trades in window to avoid single-trade noise.
             let flow = self.trade_flow.imbalance();
             let flow_gate_threshold = dec!(0.6);
-            if flow > flow_gate_threshold && ask_active {
+            let flow_reliable = self.trade_flow.trade_count() >= 3;
+            if flow_reliable && flow > flow_gate_threshold && ask_active {
                 ask_active = false;
                 info!(flow = %flow, "Flow gating → no ask (strong buy flow on Binance)");
             }
-            if flow < -flow_gate_threshold && bid_active {
+            if flow_reliable && flow < -flow_gate_threshold && bid_active {
                 bid_active = false;
                 info!(flow = %flow, "Flow gating → no bid (strong sell flow on Binance)");
             }

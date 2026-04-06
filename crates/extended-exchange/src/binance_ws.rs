@@ -148,12 +148,24 @@ impl BinanceWs {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
-                            let bid_size: Decimal = ticker.bid_qty.parse().unwrap_or(Decimal::ZERO);
+                            let bid_size: Decimal = match ticker.bid_qty.parse() {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!(error = %e, raw = %ticker.bid_qty, "Binance bid_qty parse failed, using 0");
+                                    Decimal::ZERO
+                                }
+                            };
                             let ask: Decimal = match ticker.ask_price.parse() {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
-                            let ask_size: Decimal = ticker.ask_qty.parse().unwrap_or(Decimal::ZERO);
+                            let ask_size: Decimal = match ticker.ask_qty.parse() {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!(error = %e, raw = %ticker.ask_qty, "Binance ask_qty parse failed, using 0");
+                                    Decimal::ZERO
+                                }
+                            };
                             let _ = event_tx.send(BotEvent::BinanceBbo {
                                 bid,
                                 bid_size,

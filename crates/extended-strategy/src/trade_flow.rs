@@ -76,6 +76,12 @@ impl TradeFlowTracker {
         (buy, sell)
     }
 
+    /// Number of trades in the current window.
+    pub fn trade_count(&mut self) -> usize {
+        self.expire();
+        self.trades.len()
+    }
+
     /// Imbalance = (buy_volume - sell_volume) / total_volume ∈ [-1, 1].
     /// Returns 0 when the window is empty.
     pub fn imbalance(&mut self) -> Decimal {
