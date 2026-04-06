@@ -48,7 +48,9 @@ impl CoinPosition {
 
     pub fn can_increase(&self, is_buy: bool) -> bool {
         let notional = self.notional_usd();
-        if notional >= self.max_position_usd {
+        // Block at 80% of limit so the in-flight order cannot overshoot max_position_usd.
+        let limit = self.max_position_usd * dec!(0.8);
+        if notional >= limit {
             if is_buy && self.size > Decimal::ZERO { return false; }
             if !is_buy && self.size < Decimal::ZERO { return false; }
         }

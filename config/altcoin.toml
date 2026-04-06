@@ -26,7 +26,7 @@ min_requote_interval_ms = 200  # 200ms debounce — fast enough to avoid stalene
 
 # Spread — wider to capture more per fill
 base_spread_bps = 16.0        # 16bps base — each side captures 8bps, covers -5bps markout
-min_spread_bps = 8.0          # Never tighter than 8bps
+min_spread_bps = 12.0         # raised: half-spread 6bps > markout -5bps
 max_spread_bps = 30.0         # Allow wider in volatile periods
 volatility_sensitivity = 0.3  # Less vol reaction (fewer data points)
 latency_vol_multiplier = 2.0
@@ -59,8 +59,8 @@ fast_cancel_threshold_bps = 4.0  # Cancel on 4bps adverse (must be > update_thre
 max_order_age_s = 30.0           # 30s max — stale orders have worst markout
 
 # Best price tighten — wider margin in thin books
-best_price_tighten_enabled = true
-best_price_margin_bps = 2.0     # 2bps behind BBO (vs 1bps)
+best_price_tighten_enabled = false  # disabled — code floor is the real fix
+best_price_margin_bps = 2.0         # keep existing
 
 # Close mode
 close_threshold_ratio = 0.25
@@ -76,8 +76,8 @@ hard_one_side_inventory_ratio = 0.70
 
 # Aggressive/reducing — key differences for sparse fills
 aggressive_edge_bps = 5.0       # Edge filter restored — only enter when 5bps+ edge vs Binance
-reducing_max_spread_bps = 8.0   # Start wide when exiting (vs 4bps)
-reducing_min_spread_bps = 3.0   # Min reducing spread (vs 1bps)
+reducing_max_spread_bps = 16.0  # match base spread
+reducing_min_spread_bps = 14.0  # must cover markout -5bps
 reducing_decay_s = 300.0        # 5 minute decay (vs 30s) — fills are rare
 
 # ROC guard — wider threshold for volatile alts

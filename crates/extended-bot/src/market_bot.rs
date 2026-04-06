@@ -662,7 +662,8 @@ impl MarketBot {
         let decay = tc.reducing_decay_s.max(1.0); // guard against zero
         let t = position_age_s.min(decay);
         let spread = max - (max - min) * (t / decay);
-        Decimal::try_from(spread).unwrap_or(dec!(2.0))
+        let floor = self.state.config.trading.min_spread_bps;
+        Decimal::try_from(spread.max(floor)).unwrap_or(dec!(2.0))
     }
 
     /// Returns true if there is sufficient edge on `side` vs Binance mid to justify
