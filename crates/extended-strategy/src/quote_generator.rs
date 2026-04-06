@@ -104,6 +104,13 @@ impl QuoteGenerator {
             } else { base_ask }
         } else { base_ask };
 
+        // Min spread floor: best_price_tighten must NOT compress spread below half_spread.
+        // This prevents BBO-chasing from overriding the configured min_spread.
+        let min_bid = fp * (Decimal::ONE - half_spread_ratio);
+        let min_ask = fp * (Decimal::ONE + half_spread_ratio);
+        let base_bid = base_bid.min(min_bid); // bid cannot be higher than spread allows
+        let base_ask = base_ask.max(min_ask); // ask cannot be lower than spread allows
+
         if base_bid >= base_ask {
             return GeneratedQuotes { bids: vec![], asks: vec![], reduce_only: false };
         }
