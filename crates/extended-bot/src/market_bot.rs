@@ -3,8 +3,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use std::collections::VecDeque;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::Signed;
+use rust_decimal::prelude::{Signed, ToPrimitive};
 use rust_decimal_macros::dec;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -97,6 +98,13 @@ pub struct MarketBot {
     basis_ema: Decimal,
     /// Instant when the current position was first opened (non-zero). None when flat.
     position_opened_at: Option<Instant>,
+    /// Running sum of venue edge (bps) across all fills this session.
+    venue_edge_sum_bps: f64,
+    /// Count of fills with valid venue edge measurement.
+    venue_edge_fill_count: u64,
+    /// Bounded FIFO of recently-seen fill external_ids for dedup.
+    /// x10 can emit the same Fill via ORDER|SNAPSHOT and TRADE paths.
+    recent_fill_ids: VecDeque<String>,
 }
 
 impl MarketBot {
@@ -178,6 +186,9 @@ impl MarketBot {
             is_requoting: false,
             basis_ema: Decimal::ZERO,
             position_opened_at: None,
+            venue_edge_sum_bps: 0.0,
+            venue_edge_fill_count: 0,
+            recent_fill_ids: VecDeque::with_capacity(1024),
         }
     }
 
@@ -281,7 +292,7 @@ impl MarketBot {
                 // P0-7 FIX: Markout recording moved to on_order_update (FILLED status)
                 // to avoid double-counting. Fill events are unreliable on x10.
                 let is_unknown = self.state.order_tracker.get_by_external_id(&resolved_ext_id).is_none();
-                self.on_fill(&resolved_ext_id, price, qty, fee, is_maker);
+                self.on_fill(&resolved_ext_id, price, qty, fee, is_maker, ts);
 
                 // If this was an unknown order fill, re-sync position from REST.
                 if is_unknown {
@@ -1559,8 +1570,23 @@ impl MarketBot {
         external_id.to_string()
     }
 
-    fn on_fill(&self, external_id: &str, price: Decimal, qty: Decimal, fee: Decimal, is_maker: bool) {
+    fn on_fill(&mut self, external_id: &str, price: Decimal, qty: Decimal, fee: Decimal, is_maker: bool, exchange_ts_ms: u64) {
         let market = self.state.market().to_string();
+
+        // Dedup: x10 can emit the same Fill via ORDER|SNAPSHOT and TRADE paths.
+        // Skip measurement/accumulation/logging on duplicates.
+        // Position updates below are NOT deduped here — position_manager.on_fill
+        // must handle doubles internally (pre-existing behavior).
+        let fill_id = external_id.to_string();
+        let is_fresh = !self.recent_fill_ids.iter().any(|id| id == &fill_id);
+        if is_fresh {
+            self.recent_fill_ids.push_back(fill_id);
+            if self.recent_fill_ids.len() > 1024 {
+                self.recent_fill_ids.pop_front();
+            }
+        } else {
+            debug!(external_id, "Duplicate fill event — skipping venue edge + log");
+        }
 
         let tracked = self.state.order_tracker.get_by_external_id(external_id);
         let side_is_buy = match &tracked {
@@ -1600,16 +1626,68 @@ impl MarketBot {
             "Fill"
         );
 
+        // Skip measurement/log on duplicate fills
+        if !is_fresh {
+            return;
+        }
+
         // Log to fills.jsonl for offline analysis
         let order_to_fill_ms = tracked.as_ref().map(|o| {
             o.timestamps.local_send.elapsed().as_millis() as u64
         });
-        let ts_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        // Use exchange-assigned ts for measurement when available (avoids local jitter).
+        let ts_ms = if exchange_ts_ms > 0 {
+            exchange_ts_ms
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        };
         let flow_imb = self.last_flow_imbalance;
         let depth_imb = self.last_depth_imbalance;
+
+        // Binance mid freshness gate: skip venue edge if the BBO tick is stale.
+        // A stale mid produces misleading venue edge (mixes old fair with new fill).
+        let binance_fresh = self
+            .last_binance_tick
+            .map(|t| t.elapsed() < std::time::Duration::from_millis(500))
+            .unwrap_or(false);
+        let binance_mid = *self.state.binance_mid.read();
+
+        // Pure venue edge: how far from Binance fair we got filled.
+        // Positive = we captured half-spread (bought below fair / sold above fair).
+        // Includes any adverse selection drift between quote placement and fill —
+        // that is the real net edge per the author's decomposition framework.
+        let venue_edge_bps = if binance_fresh {
+            binance_mid.and_then(|bm| {
+                if bm.is_zero() {
+                    return None;
+                }
+                let direction = if side_is_buy { Decimal::ONE } else { Decimal::NEGATIVE_ONE };
+                let edge = ((bm - price) * direction / bm) * dec!(10000);
+                edge.to_f64()
+            })
+        } else {
+            debug!("Venue edge skipped — Binance BBO stale");
+            None
+        };
+
+        // Accumulate for running total
+        if let Some(e) = venue_edge_bps {
+            self.venue_edge_sum_bps += e;
+            self.venue_edge_fill_count += 1;
+            if self.venue_edge_fill_count % 10 == 0 {
+                let avg = self.venue_edge_sum_bps / self.venue_edge_fill_count as f64;
+                info!(
+                    fills = self.venue_edge_fill_count,
+                    sum_bps = self.venue_edge_sum_bps,
+                    avg_bps_per_fill = avg,
+                    "Venue edge running total"
+                );
+            }
+        }
+
         self.state.fill_logger.log(&crate::fill_logger::FillRecord {
             ts_ms,
             market: market.clone(),
@@ -1622,12 +1700,13 @@ impl MarketBot {
             realized_pnl: realized,
             fair_price: self.fair_price_calc.quote_price(),
             local_mid: self.state.orderbook.mid(),
-            binance_mid: *self.state.binance_mid.read(),
+            binance_mid,
             order_to_fill_ms,
-            flow_imbalance: Some(flow_imb.to_string().parse::<f64>().unwrap_or(0.0)),
-            depth_imbalance: Some(depth_imb.to_string().parse::<f64>().unwrap_or(0.0)),
+            flow_imbalance: Some(flow_imb),
+            depth_imbalance: Some(depth_imb),
             spread_bps: None, // TODO: pass from last requote
             volatility_bps: None,
+            venue_edge_bps,
         });
     }
 
