@@ -63,4 +63,8 @@ pub struct FillRecord {
     pub spread_bps: Option<f64>,
     /// Volatility in bps at time of fill
     pub volatility_bps: Option<f64>,
+    /// Venue edge in bps: (binance_mid - fill_price) * direction.
+    /// Positive = bought below fair or sold above fair (we captured spread).
+    /// This is the pure MM edge, isolated from directional price drift.
+    pub venue_edge_bps: Option<f64>,
 }
