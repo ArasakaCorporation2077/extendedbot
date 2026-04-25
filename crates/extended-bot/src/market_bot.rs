@@ -950,18 +950,19 @@ impl MarketBot {
             let mut bid_active = true;
             let mut ask_active = true;
 
-            // Basis filter: block the disadvantaged side on sudden basis deviation.
+            // Absolute basis filter: when x10 trades far from Binance fair, block
+            // the side that would buy/sell at extreme adverse-selection prices.
+            // basis = (local_mid - binance_mid) / binance_mid × 10000 bps.
+            // basis > +25bps  → x10 expensive → don't BUY (would buy at premium)
+            // basis < -25bps  → x10 cheap     → don't SELL (would sell at discount)
             if !bn_mid.is_zero() && !x10_mid.is_zero() {
                 let current_basis_bps = ((x10_mid - bn_mid) / bn_mid) * dec!(10000);
-                let basis_deviation = (current_basis_bps - self.basis_ema).abs();
-                if basis_deviation > dec!(10) {
-                    if current_basis_bps > self.basis_ema {
-                        ask_active = false;
-                        info!(basis_deviation = %basis_deviation, "Basis filter (flat) → no ask (sudden premium)");
-                    } else {
-                        bid_active = false;
-                        info!(basis_deviation = %basis_deviation, "Basis filter (flat) → no bid (sudden discount)");
-                    }
+                if current_basis_bps > dec!(25) {
+                    bid_active = false;
+                    info!(basis_bps = %current_basis_bps, "Basis filter → no bid (x10 premium > 25bps)");
+                } else if current_basis_bps < dec!(-25) {
+                    ask_active = false;
+                    info!(basis_bps = %current_basis_bps, "Basis filter → no ask (x10 discount > 25bps)");
                 }
             }
 

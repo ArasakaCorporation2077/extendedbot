@@ -106,14 +106,19 @@ impl FairPriceCalculator {
     }
 
     /// EWMA of (x10_mid - binance_mid).
-    /// Add this to fair_price when generating quotes so they land on x10 orderbook.
+    /// Used for monitoring and basis-aware filtering only — NOT added to quote_price.
+    /// Adding basis_offset would make quote_price ≈ local_mid, defeating the purpose
+    /// of using Binance as the reference. Quote off Binance and let post_only handle
+    /// non-marketable cases; basis is captured as venue edge per fill.
     pub fn basis_offset(&self) -> Decimal {
         self.basis_offset_ewma.unwrap_or(Decimal::ZERO)
     }
 
-    /// fair_price + basis_offset — use this as QuoteInput.fair_price.
+    /// Pure Binance fair value — use this as QuoteInput.fair_price.
+    /// This is the cross-venue reference. We quote a spread around it and let
+    /// post_only_no_cross handle cases where x10's local market is far from Binance.
     pub fn quote_price(&self) -> Option<Decimal> {
-        self.fair_price.map(|fp| fp + self.basis_offset())
+        self.fair_price
     }
 
     /// Apply a trade-flow shift (in absolute price units) on top of quote_price.
@@ -162,25 +167,23 @@ mod tests {
     fn test_binance_is_fair_price() {
         let mut calc = FairPriceCalculator::new(dec!(1.0));
         calc.update_local_mid(dec!(100));
-        // binance=102, x10=100 → basis_offset = 100-102 = -2 → quote_price = 102-2 = 100
+        // binance=102, x10=100 → quote_price = binance_mid (NOT local-anchored)
         calc.update_reference_mid(dec!(102));
         assert_eq!(calc.fair_price(), Some(dec!(102))); // raw = binance
-        assert_eq!(calc.basis_offset(), dec!(-2));
-        assert_eq!(calc.quote_price(), Some(dec!(100))); // lands on x10
+        assert_eq!(calc.basis_offset(), dec!(-2)); // tracked for monitoring
+        assert_eq!(calc.quote_price(), Some(dec!(102))); // = Binance, no local anchor
     }
 
     #[test]
     fn test_binance_move_shifts_fair_price() {
         let mut calc = FairPriceCalculator::new(dec!(1.0));
         calc.update_local_mid(dec!(100));
-        calc.update_reference_mid(dec!(102)); // basis_offset = -2
-        // Binance jumps to 105 — fair_price immediately = 105
+        calc.update_reference_mid(dec!(102));
+        // Binance jumps to 105 — fair_price + quote_price both = 105
         calc.update_reference_mid(dec!(105));
         assert_eq!(calc.fair_price(), Some(dec!(105)));
-        // basis_offset EWMA: 0.01 * (100-105) + 0.99 * (-2) — but alpha=1.0 here
-        // alpha=1.0: new basis = 100-105 = -5
-        assert_eq!(calc.basis_offset(), dec!(-5));
-        assert_eq!(calc.quote_price(), Some(dec!(100))); // still tracks x10
+        assert_eq!(calc.basis_offset(), dec!(-5)); // basis tracked for filter
+        assert_eq!(calc.quote_price(), Some(dec!(105))); // tracks Binance
     }
 
     #[test]
