@@ -149,9 +149,10 @@ adj = raw - binance_market_movement
 - **서명**: SNIP12 Poseidon hash + StarkEx ECDSA, domain: Perpetuals/v0/SN_MAIN/1
 
 ### Binance (Reference Price)
-- bookTicker: `wss://fstream.binance.com/ws/{symbol}@bookTicker` (BBO, 초당 30+회)
-- aggTrade: `wss://fstream.binance.com/ws/{symbol}@aggTrade` (체결, VPIN + trade flow)
-- depth20: `wss://fstream.binance.com/ws/{symbol}@depth20@100ms` (오더북 depth)
+- bookTicker: `wss://fstream.binance.com/public/ws/{symbol}@bookTicker` (BBO, 초당 30+회)
+- aggTrade: `wss://fstream.binance.com/market/ws/{symbol}@aggTrade` (체결, VPIN + trade flow)
+- depth20: `wss://fstream.binance.com/public/ws/{symbol}@depth20@100ms` (오더북 depth)
+- 마이그레이션 2026-04-23 데드라인 통과 — legacy `/ws/` 경로 비활성화됨
 - 심볼 매핑: `TAO-USD` → `taousdt`, `CRCL_24_5-USD` → `crclusdt` (날짜 접미사 자동 제거)
 
 ### 조사한 다른 거래소

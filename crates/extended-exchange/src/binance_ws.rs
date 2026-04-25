@@ -1,7 +1,14 @@
 //! Binance Futures WebSocket feeds — bookTicker (reference BBO) and aggTrade (flow signal).
 //!
-//! bookTicker: `wss://fstream.binance.com/ws/{symbol}@bookTicker`
-//! aggTrade:   `wss://fstream.binance.com/ws/{symbol}@aggTrade`
+//! Per Binance migration (2026-04-23 deadline) the legacy `/ws/` and `/stream/` paths
+//! are deprecated. Streams now route through dedicated endpoints:
+//!   /public — bookTicker, depth (high-frequency public market data)
+//!   /market — aggTrade, markPrice, kline (regular market data)
+//!   /private — user data
+//!
+//! bookTicker: `wss://fstream.binance.com/public/ws/{symbol}@bookTicker`
+//! depth20:    `wss://fstream.binance.com/public/ws/{symbol}@depth20@100ms`
+//! aggTrade:   `wss://fstream.binance.com/market/ws/{symbol}@aggTrade`
 
 use std::time::{Duration, Instant};
 
@@ -130,7 +137,7 @@ impl BinanceWs {
         event_tx: &mpsc::UnboundedSender<BotEvent>,
     ) -> Result<()> {
         let url = format!(
-            "wss://fstream.binance.com/ws/{}@bookTicker",
+            "wss://fstream.binance.com/public/ws/{}@bookTicker",
             self.symbol
         );
         info!(url = %url, "Connecting to Binance bookTicker");
@@ -204,7 +211,7 @@ impl BinanceWs {
         event_tx: &mpsc::UnboundedSender<BotEvent>,
     ) -> Result<()> {
         let url = format!(
-            "wss://fstream.binance.com/ws/{}@depth20@100ms",
+            "wss://fstream.binance.com/public/ws/{}@depth20@100ms",
             self.symbol
         );
         info!(url = %url, "Connecting to Binance depth20");
@@ -267,7 +274,7 @@ impl BinanceWs {
         event_tx: &mpsc::UnboundedSender<BotEvent>,
     ) -> Result<()> {
         let url = format!(
-            "wss://fstream.binance.com/ws/{}@aggTrade",
+            "wss://fstream.binance.com/market/ws/{}@aggTrade",
             self.symbol
         );
         info!(url = %url, "Connecting to Binance aggTrade");
