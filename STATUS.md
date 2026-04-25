@@ -45,12 +45,13 @@ extended-bot/       — MarketBot (메인 루프), Orchestrator (시작/종료),
 **crates/extended-strategy/src/fair_price.rs** — Fair Value 계산
 ```
 fair_price   = binance_mid          (즉시 반응, fast cancel 기준)
-basis_offset = EWMA(x10_mid - binance_mid, alpha=0.01)  (느린 추적)
-quote_price  = fair_price + basis_offset  (호가 위치 = x10 orderbook 기준)
+quote_price  = binance_mid          (= fair_price; cross-venue reference)
+basis_offset = EWMA(x10_mid - binance_mid, alpha=0.01)  (모니터링/필터 전용)
 ```
 - `update_local_mid()`: x10 orderbook mid 업데이트
 - `update_reference_mid()`: 바이낸스 mid 업데이트
-- `quote_price()`: fair_price + basis_offset (QuoteInput에 전달)
+- `quote_price()`: binance_mid 그대로 반환 (basis는 더하지 않음 — 더하면 quote_price ≈ local_mid가 됨)
+- basis는 (1) per-fill venue edge 측정, (2) 절대 basis 필터(±25bps), (3) aggressive edge 게이트 reference 보정에만 사용
 
 **crates/extended-strategy/src/spread.rs** — 스프레드 계산
 ```
@@ -268,7 +269,7 @@ expiry_days = 7                 # 주문 만료 (GTT)
 dead_man_switch_timeout_ms = 60000  # DMS heartbeat 간격
 
 # Fair price
-ewma_alpha = 0.01               # basis_offset EWMA 속도 (느림)
+ewma_alpha = 0.01               # basis_offset EWMA 속도 (모니터링/필터용; quote anchor에는 미적용)
 update_threshold_bps = 3.0       # requote 트리거 threshold
 min_requote_interval_ms = 500    # requote 최소 간격
 

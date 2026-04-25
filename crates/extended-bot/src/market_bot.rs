@@ -95,7 +95,6 @@ pub struct MarketBot {
     consecutive_rejects: u32,
     order_seq: u64,
     is_requoting: bool,
-    basis_ema: Decimal,
     /// Instant when the current position was first opened (non-zero). None when flat.
     position_opened_at: Option<Instant>,
     /// Running sum of venue edge (bps) across all fills this session.
@@ -184,7 +183,6 @@ impl MarketBot {
             consecutive_rejects: 0,
             order_seq: 0,
             is_requoting: false,
-            basis_ema: Decimal::ZERO,
             position_opened_at: None,
             venue_edge_sum_bps: 0.0,
             venue_edge_fill_count: 0,
@@ -511,7 +509,7 @@ impl MarketBot {
         let _ = self.state.book_notify.send(seq);
 
         if should_requote {
-            // quote_price = fair_price + basis_offset (lands on x10 orderbook)
+            // quote_price = binance_mid (cross-venue reference; basis NOT added)
             // + trade_flow shift (positive = buy pressure → raise fair price)
             // + depth imbalance shift (leading signal from resting book pressure)
             let tc = &self.state.config.trading;
@@ -797,18 +795,9 @@ impl MarketBot {
         // Calculate skew
         let skew = self.skew_calc.calculate(inventory_ratio, fair_price);
 
-        // Basis EMA update (used for basis filter below)
         let tc = &self.state.config.trading;
         let x10_mid = self.state.orderbook.mid().unwrap_or(Decimal::ZERO);
         let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
-        if !bn_mid.is_zero() && !x10_mid.is_zero() {
-            let current_basis_bps = ((x10_mid - bn_mid) / bn_mid) * dec!(10000);
-            if self.basis_ema.is_zero() {
-                self.basis_ema = current_basis_bps;
-            } else {
-                self.basis_ema = self.basis_ema * dec!(0.99) + current_basis_bps * dec!(0.01);
-            }
-        }
 
         // Time filter: add fixed bps during toxic hours instead of multiplying.
         let hour_utc = chrono::Utc::now().hour();
