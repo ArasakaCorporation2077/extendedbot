@@ -95,6 +95,11 @@ pub struct MarketBot {
     consecutive_rejects: u32,
     order_seq: u64,
     is_requoting: bool,
+    /// Snapshot of (local_mid - binance_mid) / binance_mid × 10000, in bps, at the
+    /// moment of the most recent quote send. Used to detect "stale quote" adverse
+    /// selection: if basis drifts far from this snapshot while our orders sit in
+    /// the book, the affected side is cancelled to avoid being picked off.
+    basis_at_last_quote: Option<Decimal>,
     /// Instant when the current position was first opened (non-zero). None when flat.
     position_opened_at: Option<Instant>,
     /// Running sum of venue edge (bps) across all fills this session.
@@ -183,6 +188,7 @@ impl MarketBot {
             consecutive_rejects: 0,
             order_seq: 0,
             is_requoting: false,
+            basis_at_last_quote: None,
             position_opened_at: None,
             venue_edge_sum_bps: 0.0,
             venue_edge_fill_count: 0,
@@ -596,6 +602,22 @@ impl MarketBot {
         let best_bid = self.state.orderbook.best_bid().map(|l| l.price);
         let best_ask = self.state.orderbook.best_ask().map(|l| l.price);
 
+        // Detect basis drift since last quote. Threshold 8bps ≈ our half_spread:
+        // if basis moves more than that, the affected side's quote is now mispriced
+        // versus current x10 fair, and adverse-selection risk dominates.
+        // Direction matters: basis going UP (x10 more expensive) only stales BIDs
+        // (we'd buy at premium). Going DOWN only stales ASKs.
+        let basis_change_threshold_bps = dec!(8);
+        let basis_drift_bps: Option<Decimal> = self.basis_at_last_quote.and_then(|snapshot| {
+            let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
+            let x10_mid = self.state.orderbook.mid().unwrap_or(Decimal::ZERO);
+            if bn_mid.is_zero() || x10_mid.is_zero() {
+                return None;
+            }
+            let current = ((x10_mid - bn_mid) / bn_mid) * dec!(10000);
+            Some(current - snapshot)
+        });
+
         let live_orders = self.state.order_tracker.live_orders(self.state.market());
 
         // Collect exchange IDs of orders that need cancelling.
@@ -618,12 +640,33 @@ impl MarketBot {
                 placed_at: order.timestamps.local_send,
             };
 
-            if let Some(reason) = self.fast_cancel.should_cancel(&info, fair_price, best_bid, best_ask) {
+            // Basis-drift cancel: stale-quote adverse selection guard.
+            let basis_stale = match basis_drift_bps {
+                Some(drift) if order.side == Side::Buy && drift > basis_change_threshold_bps => true,
+                Some(drift) if order.side == Side::Sell && drift < -basis_change_threshold_bps => true,
+                _ => false,
+            };
+
+            let should_cancel = if basis_stale {
+                info!(
+                    external_id = %order.external_id,
+                    side = ?order.side,
+                    drift_bps = %basis_drift_bps.unwrap_or(Decimal::ZERO),
+                    "Fast cancel triggered (basis drift)"
+                );
+                true
+            } else if let Some(reason) = self.fast_cancel.should_cancel(&info, fair_price, best_bid, best_ask) {
                 debug!(
                     external_id = %order.external_id,
                     reason = ?reason,
                     "Fast cancel triggered"
                 );
+                true
+            } else {
+                false
+            };
+
+            if should_cancel {
                 self.state.order_tracker.mark_pending_cancel(&order.external_id);
                 cancel_eids.push((exchange_id, order.external_id.clone()));
             }
@@ -798,6 +841,14 @@ impl MarketBot {
         let tc = &self.state.config.trading;
         let x10_mid = self.state.orderbook.mid().unwrap_or(Decimal::ZERO);
         let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
+
+        // Snapshot basis at quote send time. check_fast_cancel uses this later to
+        // detect stale-quote adverse selection (basis drifting while orders are live).
+        self.basis_at_last_quote = if !bn_mid.is_zero() && !x10_mid.is_zero() {
+            Some(((x10_mid - bn_mid) / bn_mid) * dec!(10000))
+        } else {
+            None
+        };
 
         // Time filter: add fixed bps during toxic hours instead of multiplying.
         let hour_utc = chrono::Utc::now().hour();
