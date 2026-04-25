@@ -1,17 +1,20 @@
 //! Fair price calculator.
 //!
-//! fair_price = binance_mid  (즉시 반응)
-//! basis_offset = EWMA(x10_mid - binance_mid)  (x10 프리미엄/디스카운트 추적)
+//! fair_price  = binance_mid  (즉시 반응; Binance 없으면 local_mid로 fallback)
+//! quote_price = binance_mid  (= fair_price; cross-venue reference)
+//! basis_offset = EWMA(x10_mid - binance_mid)  (모니터링/필터 전용)
 //!
 //! 호가 위치:
-//!   bid = fair_price - half_spread + basis_offset + skew
-//!   ask = fair_price + half_spread + basis_offset + skew
+//!   bid = quote_price - half_spread + skew  (basis_offset은 더하지 않음)
+//!   ask = quote_price + half_spread + skew
 //!
-//! QuoteInput.fair_price에 (fair_price + basis_offset)을 넘기면 됨.
+//! basis_offset을 quote_price에 더하면 quote_price ≈ local_mid가 되어
+//! Binance를 reference로 쓰는 의미가 사라짐 (x10 프리미엄에 사고 디스카운트에 팔게 됨).
+//! basis는 (1) per-fill venue edge 측정, (2) 절대 basis 필터, (3) aggressive
+//! edge 게이트의 reference 보정에만 사용. Quote anchor 자체는 항상 Binance.
+//!
 //! Binance가 급변하면 fair_price가 즉시 반응 → fast cancel 트리거.
-//! basis_offset은 alpha=0.01로 느리게 추적 → 호가가 x10 orderbook에 안정적으로 위치.
-//!
-//! Binance 없으면 local_mid로 fallback (basis_offset=0).
+//! 비-호가 가능한 경우는 post_only_no_cross가 처리.
 
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
