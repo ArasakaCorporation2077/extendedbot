@@ -942,16 +942,20 @@ impl MarketBot {
             // Absolute basis filter: when x10 trades far from Binance fair, block
             // the side that would buy/sell at extreme adverse-selection prices.
             // basis = (local_mid - binance_mid) / binance_mid × 10000 bps.
-            // basis > +25bps  → x10 expensive → don't BUY (would buy at premium)
-            // basis < -25bps  → x10 cheap     → don't SELL (would sell at discount)
+            // basis > +10bps  → x10 expensive → don't BUY (would buy at premium)
+            // basis < -10bps  → x10 cheap     → don't SELL (would sell at discount)
+            // Tightened from ±25 → ±10 after 2026-04-25 fill data: a +12.5bps
+            // basis fill leaked through and produced -10.75bps venue_edge,
+            // dominating the early sample. The ±10 threshold is still permissive
+            // (typical noise basis < 5bps) while blocking the regime we know costs.
             if !bn_mid.is_zero() && !x10_mid.is_zero() {
                 let current_basis_bps = ((x10_mid - bn_mid) / bn_mid) * dec!(10000);
-                if current_basis_bps > dec!(25) {
+                if current_basis_bps > dec!(10) {
                     bid_active = false;
-                    info!(basis_bps = %current_basis_bps, "Basis filter → no bid (x10 premium > 25bps)");
-                } else if current_basis_bps < dec!(-25) {
+                    info!(basis_bps = %current_basis_bps, "Basis filter → no bid (x10 premium > 10bps)");
+                } else if current_basis_bps < dec!(-10) {
                     ask_active = false;
-                    info!(basis_bps = %current_basis_bps, "Basis filter → no ask (x10 discount > 25bps)");
+                    info!(basis_bps = %current_basis_bps, "Basis filter → no ask (x10 discount > 10bps)");
                 }
             }
 
