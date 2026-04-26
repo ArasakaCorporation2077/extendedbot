@@ -20,6 +20,7 @@ parking_lot = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 hex = { workspace = true }
+base64 = "0.22"
 
 # Ethereum primitives + EIP-712 + signing
 alloy-primitives = { version = "0.8", features = ["serde"] }

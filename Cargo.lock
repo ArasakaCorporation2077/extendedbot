@@ -1482,6 +1482,8 @@ dependencies = [
 name = "extended-bot"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
+ "alloy-signer-local",
  "anyhow",
  "async-trait",
  "chrono",
@@ -1493,6 +1495,7 @@ dependencies = [
  "extended-exchange",
  "extended-orderbook",
  "extended-paper",
+ "extended-risex",
  "extended-risk",
  "extended-strategy",
  "extended-types",
@@ -1591,6 +1594,7 @@ dependencies = [
  "alloy-sol-types",
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "extended-types",
  "futures-util",

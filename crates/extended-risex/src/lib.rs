@@ -10,8 +10,12 @@
 //!   types         — request/response types
 
 pub mod encoder;
+pub mod rest;
+pub mod rest_types;
 pub mod signing;
 pub mod types;
 
 pub use encoder::{encode_order, encode_cancel_order, encode_cancel_all, OrderParams, CancelParams};
+pub use rest::{ExchangeClient, InfoClient};
+pub use rest_types::{OrderResponse, CancelResponse, NonceState, Orderbook, OpenOrder};
 pub use signing::{sign_witness, sign_witness_async, DomainConfig, WitnessParams};
