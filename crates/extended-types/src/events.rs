@@ -89,11 +89,16 @@ pub enum BotEvent {
         received_at: Instant,
     },
 
-    /// Hyperliquid l2Book best bid/offer for a single coin (e.g. HYPE).
+    /// Hyperliquid best bid/offer for a single coin (e.g. HYPE).
     /// Used as fair-price reference for venues where Hyperliquid is
     /// the deepest/most-canonical book (HYPE, native HL listings).
+    ///
+    /// `channel` distinguishes the source: `"l2Book"` (snapshot, ~500ms batched)
+    /// vs `"bbo"` (real-time push on top-of-book change). Use `bbo` for
+    /// fair-price refresh; `l2Book` for depth-aware sizing.
     HyperliquidBbo {
         coin: String,
+        channel: String,
         bid: Decimal,
         bid_size: Decimal,
         ask: Decimal,

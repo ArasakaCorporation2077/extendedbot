@@ -1,0 +1,31 @@
+[package]
+name = "extended-risex"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+extended-types = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+hex = { workspace = true }
+
+# Ethereum primitives + EIP-712 + signing
+alloy-primitives = { version = "0.8", features = ["serde"] }
+alloy-sol-types = "0.8"
+alloy-signer = "0.8"
+alloy-signer-local = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true }

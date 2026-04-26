@@ -4,6 +4,7 @@ members = [
     "crates/extended-crypto",
     "crates/extended-exchange",
     "crates/extended-orderbook",
+    "crates/extended-risex",
     "crates/extended-risk",
     "crates/extended-strategy",
     "crates/extended-paper",
@@ -73,6 +74,7 @@ extended-types = { path = "crates/extended-types" }
 extended-crypto = { path = "crates/extended-crypto" }
 extended-exchange = { path = "crates/extended-exchange" }
 extended-orderbook = { path = "crates/extended-orderbook" }
+extended-risex = { path = "crates/extended-risex" }
 extended-risk = { path = "crates/extended-risk" }
 extended-strategy = { path = "crates/extended-strategy" }
 extended-paper = { path = "crates/extended-paper" }
