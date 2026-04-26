@@ -17,9 +17,21 @@ use rust_decimal_macros::dec;
 use tracing::{debug, info, warn};
 
 /// Markout time horizons in milliseconds.
-/// Short horizons (50-500ms) detect fast adverse selection.
-/// Longer horizons (1-5s) measure sustained fill quality.
-pub const HORIZONS_MS: [u64; 5] = [50, 200, 500, 1_000, 5_000];
+///
+/// Goal: locate the optimal taker-exit time per side. We expect markout to be
+/// positive at short horizons (no ultra-fast HFT competing on sparse alts),
+/// then turn negative as informed mid-frequency flow walks the price against
+/// us. Fine-grained horizons in the 0.1–5s window let us identify the peak.
+///
+/// Short (100–500ms): fast adverse selection detection.
+/// Mid (750ms–2s):    primary candidate region for taker exit timeout.
+/// Long (3–5s):       confirms the markout decay seen in earlier 5s sample.
+pub const HORIZONS_MS: [u64; 10] = [
+    100, 250, 500, 750, 1_000, 1_500, 2_000, 3_000, 4_000, 5_000,
+];
+
+/// Number of markout horizons. Used for fixed-size per-horizon state arrays.
+pub const NUM_HORIZONS: usize = HORIZONS_MS.len();
 
 fn horizon_index(horizon_ms: u64) -> Option<usize> {
     HORIZONS_MS.iter().position(|&h| h == horizon_ms)
@@ -37,7 +49,7 @@ struct PendingFill {
     filled_at: Instant,
     /// Unix timestamp in ms at the moment the fill was recorded (for JSONL logging).
     filled_at_ms: i64,
-    evaluated: [bool; 5],
+    evaluated: [bool; NUM_HORIZONS],
 }
 
 /// Completed markout result in basis points.
@@ -49,21 +61,21 @@ struct CompletedMarkout {
 
 /// Per-market markout history with EWMA tracking.
 struct MarketMarkout {
-    completed: [VecDeque<CompletedMarkout>; 5],
+    completed: [VecDeque<CompletedMarkout>; NUM_HORIZONS],
     /// EWMA of raw markout (x10 mid based)
-    ewma_raw_bps: [f64; 5],
+    ewma_raw_bps: [f64; NUM_HORIZONS],
     /// EWMA of adjusted markout (Binance-corrected)
-    ewma_adj_bps: [f64; 5],
-    ewma_initialized: [bool; 5],
+    ewma_adj_bps: [f64; NUM_HORIZONS],
+    ewma_initialized: [bool; NUM_HORIZONS],
 }
 
 impl MarketMarkout {
     fn new() -> Self {
         Self {
             completed: std::array::from_fn(|_| VecDeque::new()),
-            ewma_raw_bps: [0.0; 5],
-            ewma_adj_bps: [0.0; 5],
-            ewma_initialized: [false; 5],
+            ewma_raw_bps: [0.0; NUM_HORIZONS],
+            ewma_adj_bps: [0.0; NUM_HORIZONS],
+            ewma_initialized: [false; NUM_HORIZONS],
         }
     }
 }
@@ -126,7 +138,7 @@ impl MarkoutTracker {
             binance_mid_at_fill: binance_mid,
             filled_at: Instant::now(),
             filled_at_ms: chrono::Utc::now().timestamp_millis(),
-            evaluated: [false; 5],
+            evaluated: [false; NUM_HORIZONS],
         });
     }
 
@@ -340,10 +352,16 @@ impl MarkoutTracker {
                 }
             }
             if !parts.is_empty() {
-                // tox_score needs ewma lock released, so compute from the data we have
+                // tox_score needs ewma lock released, so compute from the data we have.
+                // Look up horizon indices by value so this stays correct as the
+                // HORIZONS_MS table is reshaped (no magic indices).
                 let tox = {
-                    let raw_500 = if m.ewma_initialized[2] { Some(m.ewma_raw_bps[2]) } else { None };
-                    let adj_5s = if m.ewma_initialized[4] { Some(m.ewma_adj_bps[4]) } else { None };
+                    let raw_500 = horizon_index(500)
+                        .filter(|&i| m.ewma_initialized[i])
+                        .map(|i| m.ewma_raw_bps[i]);
+                    let adj_5s = horizon_index(5_000)
+                        .filter(|&i| m.ewma_initialized[i])
+                        .map(|i| m.ewma_adj_bps[i]);
                     match (raw_500, adj_5s) {
                         (Some(r), Some(a)) => Some((-r).max(0.0) + (-a).max(0.0)),
                         (Some(r), None) => Some((-r).max(0.0)),
