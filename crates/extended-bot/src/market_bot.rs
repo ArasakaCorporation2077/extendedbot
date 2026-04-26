@@ -753,18 +753,26 @@ impl MarketBot {
         let close_qty = pos.size.abs();
 
         // IOC limit at BBO ± slippage_cap (favouring fast fill but capping slippage).
+        // IOC limit at BBO ± slippage_cap. Snap to tick — x10 rejects unrounded
+        // prices with code 1125 (Invalid price precision). MON-USD tick is
+        // 0.00001 (5 dp); raw best * (1 ± 10bps) produces 8 dp without rounding.
+        // Direction matters: SELL rounds DOWN (more aggressive cross), BUY UP.
+        let tick_size = *self.state.tick_size.read();
+        let tick_dp = tick_size.scale();
         let cap_bps = Decimal::try_from(tc.taker_exit_slippage_cap_bps).unwrap_or(dec!(10));
         let cap_ratio = extended_types::decimal_utils::bps_to_ratio(cap_bps);
         let limit_price = match close_side {
             Side::Sell => match self.state.orderbook.best_bid() {
-                Some(l) => l.price * (Decimal::ONE - cap_ratio),
+                Some(l) => (l.price * (Decimal::ONE - cap_ratio))
+                    .round_dp_with_strategy(tick_dp, rust_decimal::RoundingStrategy::ToNegativeInfinity),
                 None => {
                     warn!("Taker exit skipped: no best_bid in book");
                     return;
                 }
             },
             Side::Buy => match self.state.orderbook.best_ask() {
-                Some(l) => l.price * (Decimal::ONE + cap_ratio),
+                Some(l) => (l.price * (Decimal::ONE + cap_ratio))
+                    .round_dp_with_strategy(tick_dp, rust_decimal::RoundingStrategy::ToPositiveInfinity),
                 None => {
                     warn!("Taker exit skipped: no best_ask in book");
                     return;
