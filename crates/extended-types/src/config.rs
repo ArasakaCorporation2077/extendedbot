@@ -166,6 +166,41 @@ pub struct TradingConfig {
     #[serde(default = "default_reducing_decay_s")]
     pub reducing_decay_s: f64,
 
+    // Asymmetric basis filter (PR after observed BUY-side leak pattern).
+    /// Block bid when (local_mid - binance_mid)/binance_mid * 1e4 exceeds this (bps).
+    /// Tighter than the SELL side because BUYs were filling at +10..+38bps basis
+    /// despite the original symmetric ±10 filter.
+    #[serde(default = "default_basis_filter_buy_premium_bps")]
+    pub basis_filter_buy_premium_bps: f64,
+    /// Block ask when basis falls below the negative of this value (bps).
+    #[serde(default = "default_basis_filter_sell_discount_bps")]
+    pub basis_filter_sell_discount_bps: f64,
+
+    // Asymmetric basis-drift cancel (PR #10 generalised).
+    /// Cancel a resting BUY when basis drifts up by more than this many bps from
+    /// the snapshot at quote-send time. Default 5 (tighter than SELL).
+    #[serde(default = "default_basis_drift_buy_bps")]
+    pub basis_drift_buy_bps: f64,
+    /// Cancel a resting SELL when basis drifts down by more than this many bps.
+    #[serde(default = "default_basis_drift_sell_bps")]
+    pub basis_drift_sell_bps: f64,
+
+    // 2-second taker exit (markout peak observed at ~2s for SELL fills).
+    /// Master switch — when true, positions older than `taker_exit_timeout_s`
+    /// are unwound via IOC reduce-only orders.
+    #[serde(default = "default_taker_exit_enabled")]
+    pub taker_exit_enabled: bool,
+    /// Maximum hold time in seconds before forced taker exit fires.
+    #[serde(default = "default_taker_exit_timeout_s")]
+    pub taker_exit_timeout_s: f64,
+    /// Slippage cap in bps for the IOC limit price (relative to BBO opposite side).
+    #[serde(default = "default_taker_exit_slippage_cap_bps")]
+    pub taker_exit_slippage_cap_bps: f64,
+    /// Minimum |position notional| in USD that triggers a taker exit. Tiny dust
+    /// is left to natural unwind to avoid paying taker fee on noise.
+    #[serde(default = "default_taker_exit_min_position_usd")]
+    pub taker_exit_min_position_usd: f64,
+
     // ROC (Rate of Change) guard
     /// Rolling window in ms for price-velocity check (default 10000 = 10s).
     #[serde(default = "default_roc_window_ms")]
@@ -235,6 +270,14 @@ fn default_aggressive_edge_bps() -> f64 { 2.0 }
 fn default_reducing_max_spread_bps() -> f64 { 4.0 }
 fn default_reducing_min_spread_bps() -> f64 { 1.0 }
 fn default_reducing_decay_s() -> f64 { 30.0 }
+fn default_basis_filter_buy_premium_bps() -> f64 { 5.0 }
+fn default_basis_filter_sell_discount_bps() -> f64 { 10.0 }
+fn default_basis_drift_buy_bps() -> f64 { 5.0 }
+fn default_basis_drift_sell_bps() -> f64 { 8.0 }
+fn default_taker_exit_enabled() -> bool { true }
+fn default_taker_exit_timeout_s() -> f64 { 2.0 }
+fn default_taker_exit_slippage_cap_bps() -> f64 { 10.0 }
+fn default_taker_exit_min_position_usd() -> f64 { 5.0 }
 fn default_max_daily_loss() -> Decimal { Decimal::new(500, 0) }
 fn default_max_orders_per_min() -> u32 { 200 }
 fn default_max_errors_per_min() -> u32 { 10 }

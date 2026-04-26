@@ -67,4 +67,9 @@ pub struct FillRecord {
     /// Positive = bought below fair or sold above fair (we captured spread).
     /// This is the pure MM edge, isolated from directional price drift.
     pub venue_edge_bps: Option<f64>,
+    /// True when this fill closed a position via the 2s taker-exit path
+    /// (IOC reduce-only). Lets offline analysis split entry venue_edge from
+    /// forced exit cost so the two are not averaged together.
+    #[serde(default)]
+    pub is_taker_exit: bool,
 }
