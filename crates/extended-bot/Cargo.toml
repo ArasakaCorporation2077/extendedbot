@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "observer"
 path = "src/bin/observer.rs"
 
+[[bin]]
+name = "hl_observer"
+path = "src/bin/hl_observer.rs"
+
 [dependencies]
 extended-types = { workspace = true }
 extended-crypto = { workspace = true }
