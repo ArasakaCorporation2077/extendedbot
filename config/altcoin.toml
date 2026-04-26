@@ -80,6 +80,20 @@ reducing_max_spread_bps = 16.0  # match base spread
 reducing_min_spread_bps = 14.0  # must cover markout -5bps
 reducing_decay_s = 300.0        # 5 min decay — sparse altcoin needs time to attract contra flow
 
+# Asymmetric basis filter — BUY side leaks at +basis, SELL side fine
+basis_filter_buy_premium_bps  = 5.0    # block bid when basis > +5  (was ±10 symmetric)
+basis_filter_sell_discount_bps = 10.0  # block ask when basis < -10 (unchanged)
+
+# Asymmetric drift cancel — BUYs go stale faster on rising basis
+basis_drift_buy_bps  = 5.0   # cancel resting BUY on +5bps drift (was 8 symmetric)
+basis_drift_sell_bps = 8.0   # cancel resting SELL on -8bps drift (unchanged)
+
+# 2-second taker exit — markout peaks at ~2s, then decays into negative
+taker_exit_enabled   = true
+taker_exit_timeout_s = 2.0
+taker_exit_slippage_cap_bps = 10.0  # IOC limit at BBO ± 10bps
+taker_exit_min_position_usd = 5.0   # ignore dust under $5
+
 # ROC guard — wider threshold for volatile alts
 roc_window_ms = 10000
 roc_threshold_bps = 20.0        # 20bps — pause quoting on strong trends early

@@ -367,6 +367,7 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
     let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
     let mut reconcile_interval = tokio::time::interval(Duration::from_secs(30));
     let mut markout_tick = tokio::time::interval(Duration::from_millis(50));
+    let mut taker_exit_tick = tokio::time::interval(Duration::from_millis(500));
     let mut dms_interval = tokio::time::interval(Duration::from_secs(
         (config.trading.dead_man_switch_timeout_ms / 3000).max(10),
     ));
@@ -422,6 +423,10 @@ pub async fn run(config: AppConfig, smoke_mode: bool) -> Result<()> {
                     let bn_mids = std::collections::HashMap::from([(market, bn_mid)]);
                     state.markout.evaluate(&mids, &bn_mids);
                 }
+            }
+
+            _ = taker_exit_tick.tick() => {
+                bot.check_taker_exit_due().await;
             }
 
             _ = dms_interval.tick() => {

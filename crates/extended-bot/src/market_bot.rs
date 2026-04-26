@@ -95,6 +95,10 @@ pub struct MarketBot {
     consecutive_rejects: u32,
     order_seq: u64,
     is_requoting: bool,
+    /// True between sending an IOC reduce-only taker exit and receiving its
+    /// terminal status. Prevents over-shoot if a natural fill arrives in the
+    /// same window.
+    is_taker_pending: bool,
     /// Snapshot of (local_mid - binance_mid) / binance_mid × 10000, in bps, at the
     /// moment of the most recent quote send. Used to detect "stale quote" adverse
     /// selection: if basis drifts far from this snapshot while our orders sit in
@@ -188,6 +192,7 @@ impl MarketBot {
             consecutive_rejects: 0,
             order_seq: 0,
             is_requoting: false,
+            is_taker_pending: false,
             basis_at_last_quote: None,
             position_opened_at: None,
             venue_edge_sum_bps: 0.0,
@@ -602,12 +607,13 @@ impl MarketBot {
         let best_bid = self.state.orderbook.best_bid().map(|l| l.price);
         let best_ask = self.state.orderbook.best_ask().map(|l| l.price);
 
-        // Detect basis drift since last quote. Threshold 8bps ≈ our half_spread:
-        // if basis moves more than that, the affected side's quote is now mispriced
-        // versus current x10 fair, and adverse-selection risk dominates.
-        // Direction matters: basis going UP (x10 more expensive) only stales BIDs
-        // (we'd buy at premium). Going DOWN only stales ASKs.
-        let basis_change_threshold_bps = dec!(8);
+        // Detect basis drift since last quote. Asymmetric thresholds: BUYs go
+        // stale faster on rising basis (the failure mode we observed) so they
+        // get a tighter cancel trigger than SELLs. Direction still matters —
+        // basis going UP stales BIDs, going DOWN stales ASKs.
+        let tc_drift = &self.state.config.trading;
+        let buy_drift_thr = Decimal::try_from(tc_drift.basis_drift_buy_bps).unwrap_or(dec!(5));
+        let sell_drift_thr = Decimal::try_from(tc_drift.basis_drift_sell_bps).unwrap_or(dec!(8));
         let basis_drift_bps: Option<Decimal> = self.basis_at_last_quote.and_then(|snapshot| {
             let bn_mid = self.state.binance_mid.read().unwrap_or(Decimal::ZERO);
             let x10_mid = self.state.orderbook.mid().unwrap_or(Decimal::ZERO);
@@ -640,10 +646,11 @@ impl MarketBot {
                 placed_at: order.timestamps.local_send,
             };
 
-            // Basis-drift cancel: stale-quote adverse selection guard.
+            // Basis-drift cancel: stale-quote adverse selection guard. Asymmetric
+            // thresholds because BUY-side leak dominated the early sample.
             let basis_stale = match basis_drift_bps {
-                Some(drift) if order.side == Side::Buy && drift > basis_change_threshold_bps => true,
-                Some(drift) if order.side == Side::Sell && drift < -basis_change_threshold_bps => true,
+                Some(drift) if order.side == Side::Buy && drift > buy_drift_thr => true,
+                Some(drift) if order.side == Side::Sell && drift < -sell_drift_thr => true,
                 _ => false,
             };
 
@@ -703,6 +710,118 @@ impl MarketBot {
             let tick_to_cancel = tick_time.elapsed().as_micros() as u64;
             self.state.latency.record_cancel_rtt(cancel_rtt);
             self.state.latency.record_tick_to_cancel(tick_to_cancel);
+        }
+    }
+
+    /// Force-close inventory via an IOC reduce-only order when the position has
+    /// been held longer than `taker_exit_timeout_s`. Markout data showed a peak
+    /// at ~2s for SELL fills then sharp decay into negative; this caps the hold
+    /// window so realised PnL aligns with the markout peak rather than the
+    /// 5s+ tail.
+    pub async fn check_taker_exit_due(&mut self) {
+        if self.state.smoke_mode { return; }
+        let tc = &self.state.config.trading;
+        if !tc.taker_exit_enabled { return; }
+        if self.is_taker_pending {
+            // A previous taker-exit IOC is still in flight; don't double-fire.
+            return;
+        }
+        if !self.state.circuit_breaker.is_trading_allowed() { return; }
+        if self.roc_guard.is_paused() { return; }
+
+        let opened_at = match self.position_opened_at {
+            Some(t) => t,
+            None => return,
+        };
+        let age_s = opened_at.elapsed().as_secs_f64();
+        if age_s < tc.taker_exit_timeout_s { return; }
+
+        let market = self.state.market().to_string();
+        let pos = match self.state.position_manager.get_position(&market) {
+            Some(p) if !p.size.is_zero() => p.clone(),
+            _ => return,
+        };
+
+        let mark = self.state.mark_price.read().unwrap_or(pos.entry_price);
+        let notional_usd = (pos.size.abs() * mark).to_f64().unwrap_or(0.0);
+        if notional_usd < tc.taker_exit_min_position_usd {
+            return;
+        }
+
+        // Direction: long → SELL, short → BUY.
+        let close_side = if pos.size > Decimal::ZERO { Side::Sell } else { Side::Buy };
+        let close_qty = pos.size.abs();
+
+        // IOC limit at BBO ± slippage_cap (favouring fast fill but capping slippage).
+        let cap_bps = Decimal::try_from(tc.taker_exit_slippage_cap_bps).unwrap_or(dec!(10));
+        let cap_ratio = extended_types::decimal_utils::bps_to_ratio(cap_bps);
+        let limit_price = match close_side {
+            Side::Sell => match self.state.orderbook.best_bid() {
+                Some(l) => l.price * (Decimal::ONE - cap_ratio),
+                None => {
+                    warn!("Taker exit skipped: no best_bid in book");
+                    return;
+                }
+            },
+            Side::Buy => match self.state.orderbook.best_ask() {
+                Some(l) => l.price * (Decimal::ONE + cap_ratio),
+                None => {
+                    warn!("Taker exit skipped: no best_ask in book");
+                    return;
+                }
+            },
+        };
+
+        self.order_seq += 1;
+        let external_id = format!("emm-takerexit-{}-{}", Uuid::new_v4().simple(), self.order_seq);
+        let expiry_ms = chrono::Utc::now().timestamp_millis() as u64
+            + self.state.config.trading.expiry_days * 24 * 3600 * 1000;
+
+        let req = OrderRequest {
+            external_id: external_id.clone(),
+            market: market.clone(),
+            side: close_side,
+            price: limit_price,
+            qty: close_qty,
+            order_type: OrderType::Limit,
+            post_only: false,
+            reduce_only: true,
+            time_in_force: TimeInForce::Ioc,
+            max_fee: dec!(0.0005), // taker fee accommodation
+            expiry_epoch_millis: expiry_ms,
+            cancel_id: None,
+        };
+
+        info!(
+            side = %close_side,
+            qty = %close_qty,
+            limit_price = %limit_price,
+            position_age_s = age_s,
+            notional_usd = notional_usd,
+            "Taker exit firing"
+        );
+
+        self.state.order_tracker.add_order(&req);
+        self.state.circuit_breaker.record_order();
+        self.is_taker_pending = true;
+
+        match self.state.adapter.create_order(&req).await {
+            Ok(ack) => {
+                info!(
+                    external_id = %external_id,
+                    accepted = ack.accepted,
+                    "Taker exit ack"
+                );
+                if !ack.accepted {
+                    warn!(external_id = %external_id, "Taker exit rejected — will retry on next tick");
+                    self.is_taker_pending = false;
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Taker exit REST error — will retry on next tick");
+                self.state.circuit_breaker.record_error();
+                self.is_taker_pending = false;
+            }
         }
     }
 
@@ -990,23 +1109,25 @@ impl MarketBot {
             let mut bid_active = true;
             let mut ask_active = true;
 
-            // Absolute basis filter: when x10 trades far from Binance fair, block
-            // the side that would buy/sell at extreme adverse-selection prices.
+            // Asymmetric basis filter. Original ±10 (PR #8) blocked the right
+            // regime but the threshold was too loose for BUYs: 16/16 BUY fills
+            // landed in basis range +10..+38 with avg venue_edge -17.15 bps.
+            // SELLs at the same threshold were fine (+1.86 bps avg).
+            // Now tighter on the BUY side, unchanged on SELL.
+            //
             // basis = (local_mid - binance_mid) / binance_mid × 10000 bps.
-            // basis > +10bps  → x10 expensive → don't BUY (would buy at premium)
-            // basis < -10bps  → x10 cheap     → don't SELL (would sell at discount)
-            // Tightened from ±25 → ±10 after 2026-04-25 fill data: a +12.5bps
-            // basis fill leaked through and produced -10.75bps venue_edge,
-            // dominating the early sample. The ±10 threshold is still permissive
-            // (typical noise basis < 5bps) while blocking the regime we know costs.
+            // basis > +buy_premium  → x10 expensive → don't BUY (premium)
+            // basis < -sell_discount → x10 cheap   → don't SELL (discount)
             if !bn_mid.is_zero() && !x10_mid.is_zero() {
                 let current_basis_bps = ((x10_mid - bn_mid) / bn_mid) * dec!(10000);
-                if current_basis_bps > dec!(10) {
+                let buy_thr = Decimal::try_from(tc.basis_filter_buy_premium_bps).unwrap_or(dec!(5));
+                let sell_thr = Decimal::try_from(tc.basis_filter_sell_discount_bps).unwrap_or(dec!(10));
+                if current_basis_bps > buy_thr {
                     bid_active = false;
-                    info!(basis_bps = %current_basis_bps, "Basis filter → no bid (x10 premium > 10bps)");
-                } else if current_basis_bps < dec!(-10) {
+                    info!(basis_bps = %current_basis_bps, threshold = %buy_thr, "Basis filter → no bid (x10 premium)");
+                } else if current_basis_bps < -sell_thr {
                     ask_active = false;
-                    info!(basis_bps = %current_basis_bps, "Basis filter → no ask (x10 discount > 10bps)");
+                    info!(basis_bps = %current_basis_bps, threshold = %sell_thr, "Basis filter → no ask (x10 discount)");
                 }
             }
 
@@ -1538,7 +1659,7 @@ impl MarketBot {
     }
 
     fn on_order_update(
-        &self,
+        &mut self,
         external_id: String,
         exchange_id: Option<String>,
         status: OrderStatus,
@@ -1588,6 +1709,10 @@ impl MarketBot {
                 status = %status,
                 "Order terminal — WS confirmed"
             );
+            // Taker exit terminal (filled, cancelled, rejected) → release pending lock.
+            if external_id.starts_with("emm-takerexit-") {
+                self.is_taker_pending = false;
+            }
         }
 
         self.state.order_tracker.on_status_update(
@@ -1617,6 +1742,14 @@ impl MarketBot {
 
     fn on_fill(&mut self, external_id: &str, price: Decimal, qty: Decimal, fee: Decimal, is_maker: bool, exchange_ts_ms: u64) {
         let market = self.state.market().to_string();
+
+        // Any fill on a taker-exit external_id terminates the pending state.
+        // Other fills don't reset the flag — they may be the natural maker fills
+        // we were trying to outrun, in which case the taker IOC will simply
+        // expire as a no-op.
+        if external_id.starts_with("emm-takerexit-") {
+            self.is_taker_pending = false;
+        }
 
         // Dedup: x10 can emit the same Fill via ORDER|SNAPSHOT and TRADE paths.
         // Skip measurement/accumulation/logging on duplicates.
@@ -1752,6 +1885,7 @@ impl MarketBot {
             spread_bps: None, // TODO: pass from last requote
             volatility_bps: None,
             venue_edge_bps,
+            is_taker_exit: external_id.starts_with("emm-takerexit-"),
         });
     }
 
