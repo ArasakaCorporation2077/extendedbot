@@ -97,10 +97,12 @@ pub struct MarketBot {
     consecutive_rejects: u32,
     order_seq: u64,
     is_requoting: bool,
-    /// True between sending an IOC reduce-only taker exit and receiving its
-    /// terminal status. Prevents over-shoot if a natural fill arrives in the
-    /// same window.
-    is_taker_pending: bool,
+    /// Instant when the most recent IOC reduce-only taker exit was sent.
+    /// `Some` between send and receiving its terminal status — prevents
+    /// over-shoot if a natural fill arrives in the same window.
+    /// Auto-released after `TAKER_PENDING_MAX` to recover from ghost-cancels
+    /// (where order_tracker.cleanup silently flips status without emitting).
+    taker_pending_since: Option<Instant>,
     /// Snapshot of (local_mid - binance_mid) / binance_mid × 10000, in bps, at the
     /// moment of the most recent quote send. Used to detect "stale quote" adverse
     /// selection: if basis drifts far from this snapshot while our orders sit in
@@ -195,7 +197,7 @@ impl MarketBot {
             consecutive_rejects: 0,
             order_seq: 0,
             is_requoting: false,
-            is_taker_pending: false,
+            taker_pending_since: None,
             basis_at_last_quote: None,
             position_opened_at: None,
             venue_edge_sum_bps: 0.0,
@@ -245,13 +247,21 @@ impl MarketBot {
                 self.fair_price_calc.update_reference_mid(mid);
                 self.vol_estimator.on_trade(mid);
                 self.roc_guard.on_price(mid);
+
+                // Binance reference moved — check live orders against the new
+                // fair price without waiting for the next x10 orderbook tick.
+                // check_fast_cancel has a 1s debounce and per-order threshold,
+                // so it only acts when orders are actually stale.
+                if self.state.order_tracker.live_count() > 0 {
+                    self.check_fast_cancel(mid, received_at).await;
+                }
             }
             BotEvent::BinanceTrade { price, qty, is_buyer_maker, received_at } => {
                 // is_buyer_maker=true → seller is aggressor → !is_buyer_maker = is_buy
                 self.vpin_calc.on_trade(qty, !is_buyer_maker);
                 self.trade_flow.on_trade(qty, is_buyer_maker, received_at);
 
-                // Trade arrives ahead of bookTicker by ~30ms on Binance Futures.
+                // Trade arrives ahead of bookTicker by ~15ms on Binance Futures.
                 // Update implied BBO and refresh fair_price immediately so quotes
                 // anchor on the latest implied mid before the book delta lands.
                 self.implied_bbo.on_trade(price, is_buyer_maker, received_at);
@@ -265,6 +275,11 @@ impl MarketBot {
                     self.fair_price_calc.update_reference_mid(implied_mid);
                     self.vol_estimator.on_trade(implied_mid);
                     self.roc_guard.on_price(implied_mid);
+
+                    // Trade-driven fair price refresh — same stale check as BBO.
+                    if self.state.order_tracker.live_count() > 0 {
+                        self.check_fast_cancel(implied_mid, received_at).await;
+                    }
                 }
             }
             BotEvent::BinanceDepth { bid_volume, ask_volume, received_at } => {
@@ -746,9 +761,20 @@ impl MarketBot {
         if self.state.smoke_mode { return; }
         let tc = &self.state.config.trading;
         if !tc.taker_exit_enabled { return; }
-        if self.is_taker_pending {
-            // A previous taker-exit IOC is still in flight; don't double-fire.
-            return;
+        // Self-heal stuck pending lock. IOC fills or rejects within ~500ms;
+        // 5s without a terminal event means the order_tracker cleanup
+        // ghost-cancelled it without emitting (see order_tracker::cleanup).
+        if let Some(since) = self.taker_pending_since {
+            if since.elapsed() > Duration::from_secs(5) {
+                warn!(
+                    age_s = since.elapsed().as_secs_f64(),
+                    "Taker exit pending lock stuck — force releasing (likely ghost-cancelled IOC)"
+                );
+                self.taker_pending_since = None;
+            } else {
+                // A previous taker-exit IOC is still in flight; don't double-fire.
+                return;
+            }
         }
         if !self.state.circuit_breaker.is_trading_allowed() { return; }
         if self.roc_guard.is_paused() { return; }
@@ -835,7 +861,7 @@ impl MarketBot {
 
         self.state.order_tracker.add_order(&req);
         self.state.circuit_breaker.record_order();
-        self.is_taker_pending = true;
+        self.taker_pending_since = Some(Instant::now());
 
         match self.state.adapter.create_order(&req).await {
             Ok(ack) => {
@@ -846,13 +872,13 @@ impl MarketBot {
                 );
                 if !ack.accepted {
                     warn!(external_id = %external_id, "Taker exit rejected — will retry on next tick");
-                    self.is_taker_pending = false;
+                    self.taker_pending_since = None;
                 }
             }
             Err(e) => {
                 warn!(error = %e, "Taker exit REST error — will retry on next tick");
                 self.state.circuit_breaker.record_error();
-                self.is_taker_pending = false;
+                self.taker_pending_since = None;
             }
         }
     }
@@ -1743,7 +1769,7 @@ impl MarketBot {
             );
             // Taker exit terminal (filled, cancelled, rejected) → release pending lock.
             if external_id.starts_with("emm-takerexit-") {
-                self.is_taker_pending = false;
+                self.taker_pending_since = None;
             }
         }
 
@@ -1780,7 +1806,7 @@ impl MarketBot {
         // we were trying to outrun, in which case the taker IOC will simply
         // expire as a no-op.
         if external_id.starts_with("emm-takerexit-") {
-            self.is_taker_pending = false;
+            self.taker_pending_since = None;
         }
 
         // Dedup: x10 can emit the same Fill via ORDER|SNAPSHOT and TRADE paths.
@@ -1815,12 +1841,32 @@ impl MarketBot {
             }
         };
 
+        let prev_size = self.state.position_manager.get_position(&market)
+            .map(|p| p.size)
+            .unwrap_or(Decimal::ZERO);
         let realized = self.state.position_manager.on_fill(&market, qty, price, side_is_buy);
 
         // Update exposure
         if let Some(pos) = self.state.position_manager.get_position(&market) {
             let notional = pos.size.abs() * pos.mark_price;
             self.state.exposure_tracker.update_position(&market, notional * pos.size.signum());
+        }
+
+        // Sync position_opened_at with fill-driven size changes. PositionUpdate WS
+        // events lag fills (sometimes via "isSnapshot:true,positions:[]" which only
+        // fires when prev_size != 0), so without this the timer drifts out of sync
+        // and taker_exit either never fires or fires on a stale position.
+        let new_size = self.state.position_manager.get_position(&market)
+            .map(|p| p.size)
+            .unwrap_or(Decimal::ZERO);
+        let was_flat = prev_size.abs() < dec!(0.0001);
+        let is_flat = new_size.abs() < dec!(0.0001);
+        if was_flat && !is_flat {
+            self.position_opened_at = Some(Instant::now());
+            info!(size = %new_size, "Position opened (fill) — starting taker_exit timer");
+        } else if !was_flat && is_flat {
+            self.position_opened_at = None;
+            info!("Position closed (fill) — clearing taker_exit timer");
         }
 
         let net_pnl = realized - fee;
