@@ -14,6 +14,7 @@ use extended_risk::fast_cancel::{FastCancel, LiveOrderInfo};
 use extended_risk::RocGuard;
 use extended_strategy::depth_imbalance::DepthImbalanceTracker;
 use extended_strategy::fair_price::FairPriceCalculator;
+use extended_strategy::implied_bbo::ImpliedBbo;
 use extended_strategy::quote_generator::{ActiveSide, GeneratedQuotes, QuoteGenerator, QuoteInput};
 use extended_strategy::skew::{SkewCalculator, SkewResult};
 use chrono::Timelike;
@@ -77,6 +78,7 @@ fn decimal_sqrt(x: Decimal) -> Decimal {
 pub struct MarketBot {
     state: Arc<BotState>,
     fair_price_calc: FairPriceCalculator,
+    implied_bbo: ImpliedBbo,
     spread_calc: SpreadCalculator,
     skew_calc: SkewCalculator,
     quote_gen: QuoteGenerator,
@@ -174,6 +176,7 @@ impl MarketBot {
         Self {
             state,
             fair_price_calc,
+            implied_bbo: ImpliedBbo::new(Duration::from_secs(1)),
             spread_calc,
             skew_calc,
             quote_gen,
@@ -228,23 +231,41 @@ impl MarketBot {
                     debug!(queue_delay_us, "Binance BBO event queue delay >5ms");
                 }
                 self.last_binance_tick = Some(received_at);
-                // Compute microprice once, use everywhere for consistency
+                self.implied_bbo.on_book(bid, ask, received_at);
+
+                // Microprice for fallback when implied is not yet primed.
                 let total_size = bid_size + ask_size;
-                let binance_mid = if total_size.is_zero() {
-                    (bid + ask) / dec!(2) // fallback to simple mid
+                let book_mid = if total_size.is_zero() {
+                    (bid + ask) / dec!(2)
                 } else {
                     (ask * bid_size + bid * ask_size) / total_size
                 };
-                *self.state.binance_mid.write() = Some(binance_mid);
-                self.fair_price_calc.update_reference_mid(binance_mid);
-                self.vol_estimator.on_trade(binance_mid);
-                self.roc_guard.on_price(binance_mid);
+                let mid = self.implied_bbo.implied_mid(received_at).unwrap_or(book_mid);
+                *self.state.binance_mid.write() = Some(mid);
+                self.fair_price_calc.update_reference_mid(mid);
+                self.vol_estimator.on_trade(mid);
+                self.roc_guard.on_price(mid);
             }
-            BotEvent::BinanceTrade { qty, is_buyer_maker, received_at, .. } => {
-                // VPIN from Binance trades — much faster signal than x10
+            BotEvent::BinanceTrade { price, qty, is_buyer_maker, received_at } => {
                 // is_buyer_maker=true → seller is aggressor → !is_buyer_maker = is_buy
                 self.vpin_calc.on_trade(qty, !is_buyer_maker);
                 self.trade_flow.on_trade(qty, is_buyer_maker, received_at);
+
+                // Trade arrives ahead of bookTicker by ~30ms on Binance Futures.
+                // Update implied BBO and refresh fair_price immediately so quotes
+                // anchor on the latest implied mid before the book delta lands.
+                self.implied_bbo.on_trade(price, is_buyer_maker, received_at);
+                if let Some(implied_mid) = self.implied_bbo.implied_mid(received_at) {
+                    // last_binance_tick reflects the freshest Binance data of any
+                    // kind (BBO or trade). on_orderbook_update reads this to
+                    // compute binance_age_us; without the trade-side update the
+                    // metric ignores the freshness implied gives us.
+                    self.last_binance_tick = Some(received_at);
+                    *self.state.binance_mid.write() = Some(implied_mid);
+                    self.fair_price_calc.update_reference_mid(implied_mid);
+                    self.vol_estimator.on_trade(implied_mid);
+                    self.roc_guard.on_price(implied_mid);
+                }
             }
             BotEvent::BinanceDepth { bid_volume, ask_volume, received_at } => {
                 let queue_delay_us = received_at.elapsed().as_micros();
@@ -442,6 +463,9 @@ impl MarketBot {
             BotEvent::Shutdown => {
                 info!("Shutdown event received");
             }
+            // Hyperliquid feeds are observation-only here — the latency profiler
+            // binary consumes them. Drop silently in the main bot.
+            BotEvent::HyperliquidBbo { .. } => {}
         }
     }
 

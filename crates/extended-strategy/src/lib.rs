@@ -1,4 +1,5 @@
 pub mod fair_price;
+pub mod implied_bbo;
 pub mod spread;
 pub mod skew;
 pub mod quote_generator;
@@ -7,6 +8,7 @@ pub mod trade_flow;
 pub mod depth_imbalance;
 
 pub use fair_price::FairPriceCalculator;
+pub use implied_bbo::ImpliedBbo;
 pub use spread::{SpreadCalculator, SpreadInput, SpreadResult};
 pub use skew::{SkewCalculator, SkewResult};
 pub use quote_generator::{QuoteGenerator, QuoteInput, GeneratedQuotes, ActiveSide};
