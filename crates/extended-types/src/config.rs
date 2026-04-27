@@ -82,6 +82,20 @@ pub struct TradingConfig {
     pub latency_vol_multiplier: f64,
     #[serde(default = "default_markout_sensitivity")]
     pub markout_sensitivity: f64,
+    /// Cap multiplier for the dynamic-edge threshold relative to base.
+    /// `aggressive_edge_threshold = (base + feedback).min(base * this)`.
+    /// Higher = wider dynamic range when markouts are bad.
+    #[serde(default = "default_markout_feedback_cap_multiplier")]
+    pub markout_feedback_cap_multiplier: f64,
+    /// Imbalance threshold |x| above which the matching side is suppressed.
+    /// Range -1..1. Lower = more aggressive flow gating, fewer one-sided fills
+    /// against directional Binance flow. Hardcoded 0.6 previously.
+    #[serde(default = "default_flow_gate_threshold")]
+    pub flow_gate_threshold: f64,
+    /// When true, use tanh(inventory_ratio) skew instead of linear.
+    /// Smooth at small positions, saturates at large ones.
+    #[serde(default = "default_true")]
+    pub price_skew_tanh: bool,
 
     // Skew
     #[serde(default = "default_true")]
@@ -245,6 +259,8 @@ fn default_max_spread() -> f64 { 20.0 }
 fn default_vol_sensitivity() -> f64 { 0.5 }
 fn default_latency_vol_multiplier() -> f64 { 2.0 }
 fn default_markout_sensitivity() -> f64 { 0.5 }
+fn default_markout_feedback_cap_multiplier() -> f64 { 6.0 }
+fn default_flow_gate_threshold() -> f64 { 0.6 }
 fn default_true() -> bool { true }
 fn default_price_skew_bps() -> f64 { 10.0 }
 fn default_size_skew_factor() -> f64 { 1.0 }

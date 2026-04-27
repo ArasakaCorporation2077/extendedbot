@@ -139,6 +139,7 @@ impl MarketBot {
         let skew_calc = SkewCalculator::new(
             tc.price_skew_enabled,
             Decimal::try_from(tc.price_skew_bps).unwrap_or(dec!(10.0)),
+            tc.price_skew_tanh,
             tc.size_skew_enabled,
             Decimal::try_from(tc.size_skew_factor).unwrap_or(dec!(1.0)),
             Decimal::try_from(tc.min_size_multiplier).unwrap_or(dec!(0.2)),
@@ -245,7 +246,9 @@ impl MarketBot {
                 let mid = self.implied_bbo.implied_mid(received_at).unwrap_or(book_mid);
                 *self.state.binance_mid.write() = Some(mid);
                 self.fair_price_calc.update_reference_mid(mid);
-                self.vol_estimator.on_trade(mid);
+                // vol_estimator now consumes BinanceTrade prices, not BBO mid —
+                // BBO churn from quote noise inflated/under-reported realized vol
+                // depending on book shape. True trade prints are the right input.
                 self.roc_guard.on_price(mid);
 
                 // Binance reference moved — check live orders against the new
@@ -260,6 +263,8 @@ impl MarketBot {
                 // is_buyer_maker=true → seller is aggressor → !is_buyer_maker = is_buy
                 self.vpin_calc.on_trade(qty, !is_buyer_maker);
                 self.trade_flow.on_trade(qty, is_buyer_maker, received_at);
+                // Realized-vol input: actual trade prints, not BBO mid.
+                self.vol_estimator.on_trade(price);
 
                 // Trade arrives ahead of bookTicker by ~15ms on Binance Futures.
                 // Update implied BBO and refresh fair_price immediately so quotes
@@ -273,7 +278,6 @@ impl MarketBot {
                     self.last_binance_tick = Some(received_at);
                     *self.state.binance_mid.write() = Some(implied_mid);
                     self.fair_price_calc.update_reference_mid(implied_mid);
-                    self.vol_estimator.on_trade(implied_mid);
                     self.roc_guard.on_price(implied_mid);
 
                     // Trade-driven fair price refresh — same stale check as BBO.
@@ -388,23 +392,23 @@ impl MarketBot {
                         info!("Position reset to flat (empty WS snapshot) — clearing position timer");
                     }
                 } else {
-                    let prev_size = self.state.position_manager.get_position(&market)
-                        .map(|p| p.size)
-                        .unwrap_or(Decimal::ZERO);
                     self.state.position_manager.set_position(&market, size, entry_price, mark_price);
                     let notional = size.abs() * mark_price;
                     self.state.exposure_tracker.update_position(&market, notional * size.signum());
 
-                    // Track when position transitions from flat to non-flat or back.
+                    // Sync position_opened_at with current state. Use absolute
+                    // (None vs Some) rather than transition (was_flat vs is_flat)
+                    // because bootstrap_state pre-populates position_manager from
+                    // REST before market_bot starts, so the prior transition check
+                    // missed resumed positions on bot restart.
                     if market == self.state.market() {
-                        let was_flat = prev_size.abs() < dec!(0.0001);
                         let is_flat = size.abs() < dec!(0.0001);
-                        if was_flat && !is_flat {
+                        if !is_flat && self.position_opened_at.is_none() {
                             self.position_opened_at = Some(Instant::now());
-                            info!(size = %size, "Position opened — starting reducing timer");
-                        } else if !was_flat && is_flat {
+                            info!(size = %size, "Position timer started (open or resumed)");
+                        } else if is_flat && self.position_opened_at.is_some() {
                             self.position_opened_at = None;
-                            info!("Position closed — resetting reducing timer");
+                            info!("Position closed — clearing timer");
                         }
                     }
                 }
@@ -883,14 +887,17 @@ impl MarketBot {
         }
     }
 
-    /// Compute the reducing-side spread (bps) using linear decay from max to min over `decay_s`.
+    /// Compute the reducing-side spread (bps). Exponential decay from max toward
+    /// min with time constant `reducing_decay_s` (τ): at t=τ ~63% of the way to
+    /// min, at 3τ ~95%. Linear decay over 5min was effectively flat (16→14
+    /// barely registered); exponential pressures exits when fresh, eases later.
     fn reducing_spread_bps(&self, position_age_s: f64) -> Decimal {
         let tc = &self.state.config.trading;
         let max = tc.reducing_max_spread_bps;
         let min = tc.reducing_min_spread_bps;
-        let decay = tc.reducing_decay_s.max(1.0); // guard against zero
-        let t = position_age_s.min(decay);
-        let spread = max - (max - min) * (t / decay);
+        let tau = tc.reducing_decay_s.max(1.0);
+        let factor = (-position_age_s / tau).exp();
+        let spread = min + (max - min) * factor;
         let floor = self.state.config.trading.min_spread_bps;
         Decimal::try_from(spread.max(floor)).unwrap_or(dec!(2.0))
     }
@@ -908,8 +915,12 @@ impl MarketBot {
             self.state.config.trading.markout_sensitivity
         ).unwrap_or(dec!(0.3));
         let markout_feedback = self.state.markout.feedback_bps(self.state.market()) * markout_sensitivity;
-        // Cap at 3x base to prevent permanent lock-out when no fills arrive to reset EWMA
-        let threshold = (base_threshold + markout_feedback).min(base_threshold * dec!(3));
+        // Cap multiplier prevents permanent lock-out when no fills arrive to
+        // reset EWMA. Configurable so toxic markets can widen the dynamic range.
+        let cap_mult = Decimal::try_from(
+            self.state.config.trading.markout_feedback_cap_multiplier
+        ).unwrap_or(dec!(3));
+        let threshold = (base_threshold + markout_feedback).min(base_threshold * cap_mult);
         let bn_mid = match *self.state.binance_mid.read() {
             Some(m) if !m.is_zero() => m,
             _ => return true, // No Binance data → allow quoting (safe fallback)
@@ -1131,7 +1142,9 @@ impl MarketBot {
             // Require 3+ trades in window to avoid single-trade noise triggering gate
             let flow = self.trade_flow.imbalance();
             let flow_reliable = self.trade_flow.trade_count() >= 3;
-            let bid_quotes = if flow_reliable && flow < -dec!(0.6) {
+            let flow_gate = Decimal::try_from(self.state.config.trading.flow_gate_threshold)
+                .unwrap_or(dec!(0.6));
+            let bid_quotes = if flow_reliable && flow < -flow_gate {
                 // Strong sell flow on Binance → don't add to long
                 debug!(flow = %flow, "Long bid suppressed — adverse sell flow");
                 vec![]
@@ -1150,7 +1163,9 @@ impl MarketBot {
             // Ask = aggressive (only if edge exists AND flow not adverse)
             let flow = self.trade_flow.imbalance();
             let flow_reliable = self.trade_flow.trade_count() >= 3;
-            let ask_quotes = if flow_reliable && flow > dec!(0.6) {
+            let flow_gate = Decimal::try_from(self.state.config.trading.flow_gate_threshold)
+                .unwrap_or(dec!(0.6));
+            let ask_quotes = if flow_reliable && flow > flow_gate {
                 // Strong buy flow on Binance → don't add to short
                 debug!(flow = %flow, "Short ask suppressed — adverse buy flow");
                 vec![]
@@ -1194,7 +1209,8 @@ impl MarketBot {
             // Strong sell flow → don't buy.
             // Require 3+ trades in window to avoid single-trade noise.
             let flow = self.trade_flow.imbalance();
-            let flow_gate_threshold = dec!(0.6);
+            let flow_gate_threshold = Decimal::try_from(self.state.config.trading.flow_gate_threshold)
+                .unwrap_or(dec!(0.6));
             let flow_reliable = self.trade_flow.trade_count() >= 3;
             if flow_reliable && flow > flow_gate_threshold && ask_active {
                 ask_active = false;

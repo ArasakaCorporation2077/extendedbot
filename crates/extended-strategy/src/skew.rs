@@ -1,4 +1,5 @@
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 use extended_types::decimal_utils::{bps_to_ratio, clamp};
 
@@ -6,6 +7,10 @@ use extended_types::decimal_utils::{bps_to_ratio, clamp};
 pub struct SkewCalculator {
     pub price_skew_enabled: bool,
     pub price_skew_bps: Decimal,
+    /// When true, use tanh(ratio) instead of ratio*|ratio| for the skew curve.
+    /// tanh saturates more gradually and leaves small positions nearly
+    /// unskewed; quadratic kicks in faster but tops out at ratio² < 1.
+    pub price_skew_tanh: bool,
     pub size_skew_enabled: bool,
     pub size_skew_factor: Decimal,
     pub min_size_multiplier: Decimal,
@@ -24,6 +29,7 @@ impl SkewCalculator {
     pub fn new(
         price_skew_enabled: bool,
         price_skew_bps: Decimal,
+        price_skew_tanh: bool,
         size_skew_enabled: bool,
         size_skew_factor: Decimal,
         min_size_multiplier: Decimal,
@@ -33,6 +39,7 @@ impl SkewCalculator {
         Self {
             price_skew_enabled,
             price_skew_bps,
+            price_skew_tanh,
             size_skew_enabled,
             size_skew_factor,
             min_size_multiplier,
@@ -44,7 +51,16 @@ impl SkewCalculator {
     pub fn calculate(&self, inventory_ratio: Decimal, mid_price: Decimal) -> SkewResult {
         let ratio = clamp(inventory_ratio, dec!(-1), dec!(1));
         let abs_ratio = ratio.abs();
-        let nonlinear_ratio = ratio * abs_ratio;
+        let nonlinear_ratio = if self.price_skew_tanh {
+            // tanh in f64 then back to Decimal. Scale by 1.5 so saturation
+            // (~tanh(1.5)=0.905) lines up with hard_one_side_inventory_ratio
+            // territory; below |ratio|=0.3 the response is nearly linear.
+            let r = ratio.to_f64().unwrap_or(0.0);
+            let t = (r * 1.5).tanh();
+            Decimal::try_from(t).unwrap_or(ratio * abs_ratio)
+        } else {
+            ratio * abs_ratio
+        };
 
         let (bid_price_offset, ask_price_offset) = if self.price_skew_enabled {
             let skew = bps_to_ratio(self.price_skew_bps) * nonlinear_ratio * mid_price;
@@ -91,7 +107,7 @@ mod tests {
 
     #[test]
     fn test_flat_no_skew() {
-        let calc = SkewCalculator::new(true, dec!(15.0), true, dec!(1.5), dec!(0.1), dec!(2.0), dec!(0.8));
+        let calc = SkewCalculator::new(true, dec!(15.0), false, true, dec!(1.5), dec!(0.1), dec!(2.0), dec!(0.8));
         let result = calc.calculate(dec!(0), dec!(100));
         assert_eq!(result.bid_price_offset, Decimal::ZERO);
         assert_eq!(result.bid_size_mult, Decimal::ONE);
@@ -99,7 +115,7 @@ mod tests {
 
     #[test]
     fn test_long_skew() {
-        let calc = SkewCalculator::new(true, dec!(15.0), true, dec!(1.5), dec!(0.1), dec!(2.0), dec!(0.8));
+        let calc = SkewCalculator::new(true, dec!(15.0), false, true, dec!(1.5), dec!(0.1), dec!(2.0), dec!(0.8));
         let result = calc.calculate(dec!(0.5), dec!(100));
         assert!(result.bid_price_offset < Decimal::ZERO);
         assert!(result.bid_size_mult < Decimal::ONE);
@@ -108,7 +124,7 @@ mod tests {
 
     #[test]
     fn test_emergency_flatten_long() {
-        let calc = SkewCalculator::new(true, dec!(15.0), true, dec!(1.5), dec!(0.1), dec!(2.0), dec!(0.8));
+        let calc = SkewCalculator::new(true, dec!(15.0), false, true, dec!(1.5), dec!(0.1), dec!(2.0), dec!(0.8));
         let result = calc.calculate(dec!(0.9), dec!(100));
         assert_eq!(result.bid_size_mult, Decimal::ZERO);
         assert!(result.ask_size_mult > Decimal::ZERO);
@@ -116,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_emergency_flatten_short() {
-        let calc = SkewCalculator::new(true, dec!(15.0), true, dec!(1.5), dec!(0.1), dec!(2.0), dec!(0.8));
+        let calc = SkewCalculator::new(true, dec!(15.0), false, true, dec!(1.5), dec!(0.1), dec!(2.0), dec!(0.8));
         let result = calc.calculate(dec!(-0.9), dec!(100));
         assert!(result.bid_size_mult > Decimal::ZERO);
         assert_eq!(result.ask_size_mult, Decimal::ZERO);
