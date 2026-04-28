@@ -89,6 +89,26 @@ pub enum BotEvent {
         received_at: Instant,
     },
 
+    /// Hyperliquid best bid/offer for a single coin (e.g. HYPE).
+    /// Used as fair-price reference for venues where Hyperliquid is
+    /// the deepest/most-canonical book (HYPE, native HL listings).
+    ///
+    /// `channel` distinguishes the source: `"l2Book"` (snapshot, ~500ms batched)
+    /// vs `"bbo"` (real-time push on top-of-book change). Use `bbo` for
+    /// fair-price refresh; `l2Book` for depth-aware sizing.
+    HyperliquidBbo {
+        coin: String,
+        channel: String,
+        bid: Decimal,
+        bid_size: Decimal,
+        ask: Decimal,
+        ask_size: Decimal,
+        /// Hyperliquid server timestamp (ms since epoch) from `data.time`.
+        /// Compared against local receive time to measure end-to-end WS latency.
+        server_time_ms: u64,
+        received_at: Instant,
+    },
+
     /// Full snapshot of all open orders from the exchange (WS isSnapshot=true).
     /// Used to sync the order tracker — any tracked order NOT in this list is stale.
     OrderSnapshot { exchange_ids: Vec<String> },

@@ -1,0 +1,19 @@
+{
+  "name": "risex-latency",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "measure": "tsx measure.ts",
+    "discover": "tsx discover.ts"
+  },
+  "dependencies": {
+    "risex-client": "^0.1.8",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  }
+}

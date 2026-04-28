@@ -11,12 +11,23 @@ path = "src/main.rs"
 name = "observer"
 path = "src/bin/observer.rs"
 
+[[bin]]
+name = "hl_observer"
+path = "src/bin/hl_observer.rs"
+
+[[bin]]
+name = "risex_smoke"
+path = "src/bin/risex_smoke.rs"
+
 [dependencies]
 extended-types = { workspace = true }
 extended-crypto = { workspace = true }
 extended-exchange = { workspace = true }
 extended-orderbook = { workspace = true }
+extended-risex = { workspace = true }
 extended-risk = { workspace = true }
+alloy-primitives = "0.8"
+alloy-signer-local = "0.8"
 extended-strategy = { workspace = true }
 extended-paper = { workspace = true }
 reqwest = { workspace = true }
